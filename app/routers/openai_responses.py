@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import json
 import logging
 
 from fastapi import APIRouter, Depends, Request
@@ -69,8 +70,10 @@ async def responses(
         return await _handle_streaming(client, deepseek_request, api_key, request.model, mapping)
     else:
         return await _handle_non_streaming(client, deepseek_request, api_key, request.model, mapping)
-
-
+def _sse_event(data: dict) -> str:
+    """Format a dict as an SSE event string."""
+    import json
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 async def _handle_non_streaming(
     client: DeepSeekClient,
     deepseek_request: DeepSeekRequest,
@@ -110,16 +113,44 @@ async def _handle_streaming(
     """Handle a streaming responses request."""
     deepseek_stream = client.chat_completion_stream(deepseek_request, api_key)
 
-    async def response_generator():
-        async for chunk_str in stream_openai_responses(
-            deepseek_stream,
-            original_model=original_model,
-            model_type=mapping.model_type,
-        ):
-            yield chunk_str
+    response_id = f"resp_{int(time.time())}"
+    created_at = int(time.time())
+
+    async def safe_response_generator():
+        """Wrap stream to handle upstream errors gracefully."""
+        import json as _json
+        emitted = False
+        try:
+            async for chunk_str in stream_openai_responses(
+                deepseek_stream,
+                original_model=original_model,
+                model_type=mapping.model_type,
+            ):
+                emitted = True
+                yield chunk_str
+        except Exception as e:
+            logger.error("Stream error (sending failed completion): %s", e)
+            if not emitted:
+                # Emit clean failure events so client doesn't get broken stream
+                yield _sse_event({
+                    "type": "response.in_progress",
+                    "response": {"id": response_id, "status": "in_progress", "model": original_model, "output": [], "created_at": created_at},
+                })
+                yield _sse_event({
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "created_at": created_at,
+                        "status": "failed",
+                        "model": original_model,
+                        "output": [],
+                        "error": {"message": str(e), "type": "upstream_error"},
+                    },
+                })
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(
-        response_generator(),
+        safe_response_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

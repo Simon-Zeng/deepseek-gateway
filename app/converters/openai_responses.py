@@ -25,6 +25,73 @@ from app.utils.sse import generate_id
 logger = logging.getLogger(__name__)
 
 
+def _flatten_content(content) -> Optional[str]:
+    """Flatten content to a string for DeepSeek.
+
+    Handles:
+    - str -> pass through
+    - list of content parts -> extract text from input_text/text/output_text parts
+    - None -> None
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict):
+                part_type = part.get("type", "")
+                if part_type in ("input_text", "text", "output_text"):
+                    text_parts.append(part.get("text", ""))
+                elif "text" in part:
+                    text_parts.append(part["text"])
+        return "\n".join(text_parts) if text_parts else None
+
+    # Fallback
+    return str(content) if content else None
+
+
+def _convert_input_item(item, messages: list):
+    """Convert a single input item (dict or Pydantic model) to DeepSeekMessage(s).
+
+    Preserves tool_calls, tool_call_id, and name fields for multi-turn
+    function calling conversations.
+    """
+    if isinstance(item, dict):
+        role = item.get("role", "user")
+        content = _flatten_content(item.get("content"))
+        tool_calls = item.get("tool_calls")
+        tool_call_id = item.get("tool_call_id")
+        name = item.get("name")
+    elif hasattr(item, "role"):
+        # Pydantic model (ResponseInputMessage)
+        role = item.role
+        content = _flatten_content(item.content)
+        tool_calls = getattr(item, "tool_calls", None)
+        tool_call_id = getattr(item, "tool_call_id", None)
+        name = getattr(item, "name", None)
+    else:
+        logger.warning("Unknown input item type, skipping: %s", type(item).__name__)
+        return
+
+    # Build the message
+    msg = DeepSeekMessage(role=role, content=content)
+
+    # Preserve tool calling fields for multi-turn conversations
+    if tool_calls:
+        msg.tool_calls = tool_calls
+    if tool_call_id:
+        msg.tool_call_id = tool_call_id
+    if name:
+        msg.name = name
+
+    messages.append(msg)
+
+
 def convert_request(
     request: ResponsesRequest,
     target_model: str,
@@ -56,39 +123,70 @@ def convert_request(
         ))
     elif isinstance(request.input, list):
         for item in request.input:
-            if isinstance(item, dict):
-                role = item.get("role", "user")
-                content = item.get("content", "")
-                # Handle content that might be a list
-                if isinstance(content, list):
-                    text_parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "input_text":
-                            text_parts.append(part.get("text", ""))
-                        elif isinstance(part, dict) and part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                        elif isinstance(part, str):
-                            text_parts.append(part)
-                    content = "\n".join(text_parts) if text_parts else ""
-                messages.append(DeepSeekMessage(role=role, content=str(content) if content else None))
-            elif hasattr(item, "role"):
-                # Pydantic model
-                content = item.content
-                if isinstance(content, list):
-                    text_parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") in ("input_text", "text"):
-                            text_parts.append(part.get("text", ""))
-                        elif isinstance(part, str):
-                            text_parts.append(part)
-                    content = "\n".join(text_parts) if text_parts else None
-                messages.append(DeepSeekMessage(role=item.role, content=content))
+            _convert_input_item(item, messages)
+
+    # Log summary for debugging
+    logger.debug(
+        "Converted %d messages, %d tools for DeepSeek (model=%s)",
+        len(messages),
+        len(request.tools) if request.tools else 0,
+        target_model,
+    )
 
     # Log warnings for unsupported features
     if request.previous_response_id:
         logger.warning("previous_response_id not supported, ignoring")
+    # Convert tools from Responses API format to Chat Completions format
+    # Responses API: {type: "function", name: "...", description: "...", input_schema: {...}}
+    # Chat Completions: {type: "function", function: {name: "...", description: "...", parameters: {...}}}
+    converted_tools = None
+    converted_tool_choice = None
     if request.tools:
-        logger.warning("tools not fully supported by DeepSeek, passing through")
+        converted_tools = []
+        for tool in request.tools:
+            tool_type = tool.get("type")
+            if tool_type == "function":
+                # Convert from Responses format to Chat Completions format
+                converted_tool = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                    }
+                }
+                # Map input_schema -> parameters
+                if "input_schema" in tool:
+                    converted_tool["function"]["parameters"] = tool["input_schema"]
+                elif "parameters" in tool:
+                    converted_tool["function"]["parameters"] = tool["parameters"]
+                # Map function key if already in that format
+                if "function" in tool:
+                    converted_tool["function"] = tool["function"]
+                converted_tools.append(converted_tool)
+            elif tool_type == "web_search_preview":
+                logger.warning("web_search_preview tool not supported by DeepSeek, skipping")
+            elif tool_type == "file_search":
+                logger.warning("file_search tool not supported by DeepSeek, skipping")
+            else:
+                logger.warning("Unknown tool type '%s', skipping", tool_type)
+
+        # Convert tool_choice from Responses format to Chat Completions format
+        # Responses: {"type": "function", "name": "func_name"} 
+        # Chat: {"type": "function", "function": {"name": "func_name"}}
+        if request.tool_choice:
+            if isinstance(request.tool_choice, dict):
+                tc = dict(request.tool_choice)
+                if "name" in tc and "function" not in tc:
+                    converted_tool_choice = {
+                        "type": tc.get("type", "function"),
+                        "function": {"name": tc["name"]},
+                    }
+                else:
+                    converted_tool_choice = tc
+            else:
+                converted_tool_choice = request.tool_choice
+
+        logger.info("Converted %d tools for DeepSeek", len(converted_tools) if converted_tools else 0)
 
     return DeepSeekRequest(
         model=target_model,
@@ -97,8 +195,8 @@ def convert_request(
         top_p=request.top_p,
         max_tokens=request.max_output_tokens,
         stream=request.stream,
-        tools=request.tools,
-        tool_choice=request.tool_choice if request.tools else None,
+        tools=converted_tools if converted_tools else None,
+        tool_choice=converted_tool_choice if converted_tools else None,
     )
 
 

@@ -274,7 +274,7 @@ async def _handle_tool_calls(state: AnthropicStreamState, tool_calls: list[dict]
             )
 
 
-
+async def _handle_content(state: AnthropicStreamState, content_text: str) -> AsyncIterator[str]:
     """Handle a content chunk."""
     # Transition from reasoning to content
     if state.phase == StreamPhase.REASONING:

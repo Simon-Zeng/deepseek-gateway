@@ -15,7 +15,7 @@ from app.models.common import ModelMappingConfig, ModelMappingRule, ModelType
 logger = logging.getLogger(__name__)
 
 # Reasoning effort levels in ascending order of strength
-EFFORT_LEVELS = {"low": 0, "medium": 1, "high": 2}
+EFFORT_LEVELS = {"low": 0, "medium": 1, "high": 2, "xhigh": 3}
 
 
 class MappingResult(BaseModel):

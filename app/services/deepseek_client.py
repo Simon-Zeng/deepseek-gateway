@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, AsyncIterator, Optional
 
@@ -194,6 +195,21 @@ class DeepSeekClient:
                             await asyncio.sleep(wait)
                             continue
                     if response.status_code < 500:
+                        # Log request body on client errors for debugging
+                        try:
+                            req_body = response.request.content
+                            if req_body:
+                                body_str = req_body.decode("utf-8", errors="replace")
+                                if len(body_str) > 4000:
+                                    body_str = body_str[:4000] + "...[truncated]"
+                                logger.error(
+                                    "DeepSeek %d request failed. Request body: %s",
+                                    response.status_code, body_str,
+                                )
+                            resp_body = response.text[:2000] if response.text else "(empty)"
+                            logger.error("DeepSeek %d response body: %s", response.status_code, resp_body)
+                        except Exception:
+                            pass
                         response.raise_for_status()
 
                     # Server error - retry
