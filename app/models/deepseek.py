@@ -41,7 +41,7 @@ class DeepSeekRequest(BaseModel):
     stop: Optional[list[str] | str] = None
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
-    n: Optional[int] = 1
+    n: Optional[int] = None
     tools: Optional[list[dict]] = None
     tool_choice: Optional[str | dict] = None
     response_format: Optional[dict] = None

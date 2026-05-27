@@ -200,13 +200,13 @@ class DeepSeekClient:
                             req_body = response.request.content
                             if req_body:
                                 body_str = req_body.decode("utf-8", errors="replace")
-                                if len(body_str) > 4000:
-                                    body_str = body_str[:4000] + "...[truncated]"
+                                if len(body_str) > 12000:
+                                    body_str = body_str[:12000] + "...[truncated]"
                                 logger.error(
                                     "DeepSeek %d request failed. Request body: %s",
                                     response.status_code, body_str,
                                 )
-                            resp_body = response.text[:2000] if response.text else "(empty)"
+                            resp_body = response.text[:4000] if response.text else "(empty)"
                             logger.error("DeepSeek %d response body: %s", response.status_code, resp_body)
                         except Exception:
                             pass

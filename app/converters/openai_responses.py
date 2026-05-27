@@ -126,11 +126,15 @@ def convert_request(
             _convert_input_item(item, messages)
 
     # Log summary for debugging
-    logger.debug(
-        "Converted %d messages, %d tools for DeepSeek (model=%s)",
+    msg_roles = [f"{m.role}({len(m.content) if m.content else 0}c)" for m in messages]
+    logger.info(
+        "Converted %d messages [%s], %d tools for DeepSeek (model=%s, stream=%s, max_tokens=%s)",
         len(messages),
-        len(request.tools) if request.tools else 0,
+        ", ".join(msg_roles),
+        len(converted_tools) if converted_tools else 0,
         target_model,
+        request.stream,
+        request.max_output_tokens,
     )
 
     # Log warnings for unsupported features
