@@ -6,10 +6,10 @@ import time
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.config import get_settings
+from app.dependencies import verify_api_key
 from app.converters.openai_chat import convert_request, convert_response
 from app.models.common import ModelType
 from app.models.deepseek import DeepSeekRequest
@@ -34,28 +34,15 @@ def get_mapper() -> ModelMapper:
 async def chat_completions(
     request: ChatCompletionRequest,
     req: Request,
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None),
+    api_key: str = Depends(verify_api_key),
 ):
     """Handle OpenAI Chat Completions API requests.
 
     Converts the request to DeepSeek format, forwards it, and converts
     the response back to OpenAI Chat format.
     """
-    settings = get_settings()
     client: DeepSeekClient = get_client()
     mapper: ModelMapper = req.app.state.model_mapper
-
-    # ── Auth ──
-    api_key = _resolve_api_key(authorization, x_api_key, settings)
-    if not api_key:
-        error_resp, status = create_openai_error(
-            message="Missing API key. Provide Authorization: Bearer <key> or x-api-key header.",
-            error_type="authentication_error",
-            status_code=401,
-            code="invalid_api_key",
-        )
-        return error_resp
 
     # ── Model Mapping (with reasoning effort override) ──
     # Some OpenAI clients send reasoning_effort as an extra field
@@ -152,35 +139,3 @@ async def _handle_streaming(
             "X-Accel-Buffering": "no",  # Nginx: disable buffering
         },
     )
-
-
-def _resolve_api_key(
-    authorization: Optional[str],
-    x_api_key: Optional[str],
-    settings,
-) -> Optional[str]:
-    """Resolve the API key to use for DeepSeek.
-
-    Logic:
-    - If GATEWAY_API_KEY is set, validate client key against it, return DEEPSEEK_API_KEY
-    - Otherwise, forward the client's key to DeepSeek
-    """
-    # Extract bearer token
-    bearer_token = None
-    if authorization:
-        if authorization.startswith("Bearer "):
-            bearer_token = authorization[7:].strip()
-        else:
-            bearer_token = authorization.strip()
-
-    # Also check x-api-key header (Anthropic-style)
-    client_key = bearer_token or x_api_key
-
-    if settings.gateway.api_key:
-        # Gateway key mode
-        if client_key == settings.gateway.api_key:
-            return settings.deepseek.api_key
-        return None  # Invalid key
-    else:
-        # Key forwarding mode
-        return client_key

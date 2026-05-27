@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.config import get_settings
+from app.dependencies import verify_api_key
 from app.converters.anthropic import convert_request, convert_response
 from app.models.common import ModelType
 from app.models.deepseek import DeepSeekRequest
@@ -32,8 +32,7 @@ ANTHROPIC_THINKING_BUDGET_HIGH_THRESHOLD = 10000
 async def anthropic_messages(
     request: AnthropicRequest,
     req: Request,
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None),
+    api_key: str = Depends(verify_api_key),
     anthropic_version: Optional[str] = Header(None),
 ):
     """Handle Anthropic Messages API requests.
@@ -44,22 +43,10 @@ async def anthropic_messages(
     Supports reasoning effort override: when thinking.budget_tokens is set to a
     high value (>= threshold), forces use of deepseek-v4-pro regardless of model_mapping.
     """
-    settings = get_settings()
     client: DeepSeekClient = get_client()
     mapper: ModelMapper = req.app.state.model_mapper
 
-    # ── Auth (Anthropic uses x-api-key header) ──
-    api_key = _resolve_api_key(authorization, x_api_key, settings)
-    if not api_key:
-        error_resp, _ = create_anthropic_error(
-            message="Missing API key. Provide x-api-key header.",
-            error_type="authentication_error",
-            status_code=401,
-        )
-        return error_resp
-
     # ── Model Mapping (with thinking budget override) ──
-    # Extract thinking config from raw request (since it's extra field)
     reasoning_effort = _extract_reasoning_effort(request)
 
     mapping = mapper.map_model(request.model, reasoning_effort=reasoning_effort)
@@ -176,32 +163,3 @@ def _extract_reasoning_effort(request: AnthropicRequest) -> Optional[str]:
                     return "medium"
 
     return None
-
-
-def _resolve_api_key(
-    authorization: Optional[str],
-    x_api_key: Optional[str],
-    settings,
-) -> Optional[str]:
-    """Resolve the API key for Anthropic requests.
-
-    Anthropic uses x-api-key header instead of Authorization: Bearer.
-    """
-    # Prefer x-api-key (Anthropic convention)
-    client_key = x_api_key
-
-    # Also check Authorization header
-    if not client_key and authorization:
-        if authorization.startswith("Bearer "):
-            client_key = authorization[7:].strip()
-        else:
-            client_key = authorization.strip()
-
-    if settings.gateway.api_key:
-        # Gateway key mode
-        if client_key == settings.gateway.api_key:
-            return settings.deepseek.api_key
-        return None
-    else:
-        # Key forwarding mode
-        return client_key

@@ -42,6 +42,8 @@ class AnthropicStreamState:
         self.input_tokens = 0
         self.output_tokens = 0
         self.text_block_started = False  # Track if we emitted content_block_start for text
+        # Tool call tracking (for streaming tool_calls from DeepSeek)
+        self.pending_tool_calls: dict[int, dict] = {}  # index -> accumulated tool call data
 
 
 async def stream_anthropic(
@@ -123,6 +125,12 @@ async def stream_anthropic(
                 async for event in _handle_reasoning(state, reasoning_text):
                     yield event
 
+            # ── Tool calls (function calling) ──
+            tool_calls = delta.get("tool_calls")
+            if tool_calls is not None:
+                async for event in _handle_tool_calls(state, tool_calls):
+                    yield event
+
             # ── Text content ──
             content_text = delta.get("content")
             if content_text is not None:
@@ -175,7 +183,98 @@ async def _handle_reasoning(state: AnthropicStreamState, reasoning_text: str) ->
     )
 
 
-async def _handle_content(state: AnthropicStreamState, content_text: str) -> AsyncIterator[str]:
+async def _handle_tool_calls(state: AnthropicStreamState, tool_calls: list[dict]) -> AsyncIterator[str]:
+    """Handle streaming tool_calls from DeepSeek, converting to Anthropic tool_use blocks.
+
+    DeepSeek streams tool calls incrementally:
+        delta.tool_calls[0] = {index: 0, id: "call_abc", function: {name: "get_weather", arguments: ""}}
+        delta.tool_calls[0] = {index: 0, function: {arguments: '{"ci'}}
+        delta.tool_calls[0] = {index: 0, function: {arguments: 'ty": "Beijing"}'}}
+
+    Anthropic expects:
+        event: content_block_start  {index: N, content_block: {type: "tool_use", id: "...", name: "...", input: {}}}
+        event: content_block_delta  {index: N, delta: {type: "input_json_delta", partial_json: "..."}}
+        event: content_block_stop   {index: N}
+    """
+    # Close any open text/reasoning block first
+    if state.phase == StreamPhase.REASONING:
+        yield format_sse_event(
+            {"type": "content_block_stop", "index": state.content_block_index},
+            event="content_block_stop",
+        )
+        state.content_block_index += 1
+    elif state.phase == StreamPhase.CONTENT and state.text_block_started:
+        yield format_sse_event(
+            {"type": "content_block_stop", "index": state.content_block_index},
+            event="content_block_stop",
+        )
+        state.content_block_index += 1
+
+    state.phase = StreamPhase.CONTENT  # Reuse CONTENT phase for tool calls
+
+    for tc_delta in tool_calls:
+        tc_index = tc_delta.get("index", 0)
+
+        # Initialize or update tool call data
+        if tc_index not in state.pending_tool_calls:
+            state.pending_tool_calls[tc_index] = {
+                "id": tc_delta.get("id", f"toolu_{generate_id()}"),
+                "name": "",
+                "arguments": "",
+                "started": False,
+            }
+
+        tc = state.pending_tool_calls[tc_index]
+
+        # Update name if present
+        func_delta = tc_delta.get("function", {})
+        if func_delta.get("name"):
+            tc["name"] = func_delta["name"]
+
+        # Accumulate arguments
+        if func_delta.get("arguments"):
+            tc["arguments"] += func_delta["arguments"]
+
+        # Update ID if present
+        if tc_delta.get("id"):
+            tc["id"] = tc_delta["id"]
+
+        # Emit content_block_start on first chunk for this tool call
+        if not tc["started"]:
+            tc["started"] = True
+            # Map tool call index to Anthropic content block index
+            tc["block_index"] = state.content_block_index
+            yield format_sse_event(
+                {
+                    "type": "content_block_start",
+                    "index": state.content_block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "input": {},
+                    },
+                },
+                event="content_block_start",
+            )
+            state.content_block_index += 1
+
+        # Emit input_json_delta for arguments
+        if func_delta.get("arguments"):
+            yield format_sse_event(
+                {
+                    "type": "content_block_delta",
+                    "index": tc.get("block_index", state.content_block_index - 1),
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": func_delta["arguments"],
+                    },
+                },
+                event="content_block_delta",
+            )
+
+
+
     """Handle a content chunk."""
     # Transition from reasoning to content
     if state.phase == StreamPhase.REASONING:
@@ -222,20 +321,28 @@ async def _handle_finish(
 ) -> AsyncIterator[str]:
     """Handle stream finish."""
     # Close any open content block
-    if state.phase in (StreamPhase.REASONING, StreamPhase.CONTENT):
-        # If still in reasoning with no content, close thinking block
-        if state.phase == StreamPhase.REASONING:
+    if state.phase == StreamPhase.REASONING:
+        # Close thinking block
+        yield format_sse_event(
+            {"type": "content_block_stop", "index": state.content_block_index},
+            event="content_block_stop",
+        )
+        state.content_block_index += 1
+    elif state.phase == StreamPhase.CONTENT:
+        # Close text block if open
+        if state.text_block_started:
             yield format_sse_event(
                 {"type": "content_block_stop", "index": state.content_block_index},
                 event="content_block_stop",
             )
-            state.content_block_index += 1
-        else:
-            # Close text block
-            yield format_sse_event(
-                {"type": "content_block_stop", "index": state.content_block_index},
-                event="content_block_stop",
-            )
+
+        # Close any tool_use blocks that are still open
+        for tc_index, tc in sorted(state.pending_tool_calls.items()):
+            if tc.get("started"):
+                yield format_sse_event(
+                    {"type": "content_block_stop", "index": tc["block_index"]},
+                    event="content_block_stop",
+                )
 
     # Map finish_reason
     stop_reason = _map_finish_reason(finish_reason)

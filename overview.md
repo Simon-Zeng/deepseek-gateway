@@ -2,25 +2,38 @@
 
 ## Overview
 
-An AI model proxy gateway that routes OpenAI/Anthropic API requests to DeepSeek, converting both request and response formats transparently. Domain: `llm.gorobotic.cn`
+An AI model proxy gateway that routes OpenAI/Anthropic API requests to DeepSeek, converting both request and response formats transparently. Designed to work with Codex, Claude Code, and Xcode Agent out of the box. Domain: `llm.gorobotic.cn`
 
 ## What Was Built
 
 ### API Endpoints
-- **POST /v1/chat/completions** — OpenAI Chat Completions API (near pass-through to DeepSeek)
-- **POST /v1/responses** — OpenAI Responses API (maps `reasoning_content` to reasoning output items)
-- **POST /v1/messages** — Anthropic Messages API (maps `reasoning_content` to thinking blocks)
-- **GET /v1/models** — List available models
-- **GET /health** — Health check
+
+| Endpoint | Protocol | Description |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat | Near pass-through to DeepSeek with content array flattening and tool call passthrough |
+| `POST /v1/responses` | OpenAI Responses | Maps `reasoning_content` to reasoning output items; supports `reasoning.effort` override |
+| `POST /v1/messages` | Anthropic Messages | Maps `reasoning_content` to thinking blocks; bidirectional tool_use ↔ tool_calls conversion |
+| `GET /v1/models` | OpenAI | Proxies DeepSeek's model list directly |
+| `GET /health` | — | Health check |
 
 ### Key Features
+
 1. **Three-protocol support**: OpenAI Chat, OpenAI Responses, Anthropic Messages
-2. **Streaming-first**: Full SSE streaming with protocol-aware conversion
+2. **Streaming-first**: Full SSE streaming with protocol-aware conversion and state machine (IDLE → REASONING → CONTENT → DONE)
 3. **Reasoning/Thinking**: DeepSeek V4 Pro `reasoning_content` → OpenAI reasoning items / Anthropic thinking blocks
-4. **Configurable model mapping**: Regex-based rules map model names → deepseek-v4-flash or deepseek-v4-pro
-5. **Reasoning effort override**: When `reasoning.effort` is "high" or above, forces deepseek-v4-pro regardless of mapping
-6. **Hybrid auth**: Gateway API key or client key forwarding
-7. **State machine streaming**: Clean phase tracking (IDLE → REASONING → CONTENT → DONE)
+4. **Configurable model mapping**: Regex-based rules map model names → `deepseek-v4-flash` or `deepseek-v4-pro`
+5. **Reasoning effort override**: When `reasoning.effort` ≥ "high" or `thinking.budget_tokens` ≥ 10000, forces `deepseek-v4-pro` regardless of mapping
+6. **Unified auth**: Single `Depends(verify_api_key)` dependency across all routers — gateway key mode or key forwarding mode
+7. **Xcode Agent compatibility**:
+   - Content arrays (`[{"type": "text", ...}]`) → flattened to strings for DeepSeek
+   - `image_url` parts → discarded (DeepSeek is text-only)
+   - `tool_calls` / `tool_call_id` / `name` → preserved through OpenAI Chat pipeline
+   - Anthropic `tool_use` blocks ↔ DeepSeek `tool_calls` bidirectional conversion
+   - Anthropic `tool_result` blocks → DeepSeek `tool` role messages
+   - Anthropic tool definitions (`input_schema`) → OpenAI format (`parameters`)
+   - Anthropic `tool_choice` → DeepSeek `tool_choice` mapping
+   - Streaming `tool_calls` → Anthropic `tool_use` content blocks with `input_json_delta`
+8. **Models endpoint**: Proxies DeepSeek's `/v1/models` directly, returning only models DeepSeek actually provides
 
 ### Model Mapping
 
@@ -32,42 +45,90 @@ An AI model proxy gateway that routes OpenAI/Anthropic API requests to DeepSeek,
 | claude-opus-4, claude-3-opus | deepseek-v4-pro | Opus models → Pro |
 | claude-3-5-sonnet, claude-haiku, claude-sonnet-4 | deepseek-v4-flash | Other Claude → Flash |
 | deepseek-v4-flash, deepseek-v4-pro | Pass-through | Direct DeepSeek access |
-| Any reasoning.effort="high" | deepseek-v4-pro | Override regardless of model |
+| Any reasoning.effort ≥ "high" | deepseek-v4-pro | Override regardless of model |
+| Any thinking.budget_tokens ≥ 10000 | deepseek-v4-pro | Anthropic thinking budget override |
 
 ### Architecture
+
 ```
-Client Request → Router → Converter (→ DeepSeek format) → DeepSeek Client
-                                                              ↓
-Client Response ← Streamer/Converter ← DeepSeek Response ← ← ←
+Client Request → Router [Depends(verify_api_key)] → Converter (→ DeepSeek format) → DeepSeek Client
+                                                                              ↓
+Client Response ← Streamer/Converter ← DeepSeek Response ← ← ← ← ← ← ← ← ← ← ←
+```
+
+**Auth flow**:
+- All routers use `Depends(verify_api_key)` from `app/dependencies.py`
+- Accepts `Authorization: Bearer <key>` or `x-api-key` header
+- If `GATEWAY_API_KEY` is set: validates client key against it, returns server's `DEEPSEEK_API_KEY`
+- If `GATEWAY_API_KEY` is not set: forwards client's key directly to DeepSeek
+
+### Tool Call Conversion (Anthropic ↔ DeepSeek)
+
+**Request direction** (Anthropic → DeepSeek):
+```
+Anthropic tool_use blocks              DeepSeek tool_calls field
+─────────────────────────              ──────────────────────────
+content: [                              tool_calls: [
+  {type: "tool_use",                     {id: "...", type: "function",
+   id: "...", name: "...",                function: {name: "...",
+   input: {...}}                           arguments: "{...}"}}
+]                                       ]
+```
+
+**Response direction** (DeepSeek → Anthropic):
+```
+DeepSeek tool_calls                    Anthropic tool_use content blocks
+───────────────────                    ──────────────────────────────────
+tool_calls: [                          content: [
+  {id: "...", type: "function",         {type: "tool_use", id: "...",
+   function: {name: "...",               name: "...", input: {...}}
+   arguments: "{...}"}}                ]
+]
+
+Streaming:
+  delta.tool_calls → content_block_start (tool_use) + input_json_delta
+```
+
+**Tool definitions conversion**:
+```
+Anthropic: {name, description, input_schema}  →  OpenAI: {type: "function", function: {name, description, parameters}}
+```
+
+**Tool choice mapping**:
+```
+Anthropic: {type: "auto"}    → DeepSeek: "auto"
+Anthropic: {type: "any"}     → DeepSeek: "required"
+Anthropic: {type: "tool"}    → DeepSeek: {type: "function", function: {name: "..."}}
 ```
 
 ### Project Structure
+
 ```
 deepseek-gateway/
 ├── app/
-│   ├── main.py              # FastAPI app, middleware, lifespan
-│   ├── config.py             # Pydantic Settings (env + YAML)
-│   ├── dependencies.py       # Auth dependency injection
-│   ├── routers/               # API endpoints
-│   │   ├── openai_chat.py     # /v1/chat/completions
-│   │   ├── openai_responses.py # /v1/responses
-│   │   ├── anthropic_messages.py # /v1/messages
-│   │   └── models.py          # /v1/models
-│   ├── converters/            # Request/Response format conversion
-│   │   ├── openai_chat.py
-│   │   ├── openai_responses.py
-│   │   └── anthropic.py
-│   ├── streamers/             # SSE streaming conversion
-│   │   ├── openai_chat.py
-│   │   ├── openai_responses.py
-│   │   └── anthropic.py
-│   ├── models/                # Pydantic schemas
-│   ├── services/              # DeepSeek client, model mapper
-│   └── utils/                  # SSE, errors, logging
+│   ├── main.py                      # FastAPI app, middleware, lifespan
+│   ├── config.py                    # Pydantic Settings (env + YAML)
+│   ├── dependencies.py              # Auth dependency injection (verify_api_key)
+│   ├── routers/
+│   │   ├── openai_chat.py           # /v1/chat/completions
+│   │   ├── openai_responses.py      # /v1/responses
+│   │   ├── anthropic_messages.py     # /v1/messages
+│   │   └── models.py                # /v1/models (proxies DeepSeek)
+│   ├── converters/
+│   │   ├── openai_chat.py           # Content flattening, tool_calls passthrough
+│   │   ├── openai_responses.py      # Reasoning effort → model mapping
+│   │   └── anthropic.py             # tool_use ↔ tool_calls, tool_result → tool, tool defs conversion
+│   ├── streamers/
+│   │   ├── openai_chat.py           # SSE streaming for OpenAI Chat
+│   │   ├── openai_responses.py      # SSE streaming for OpenAI Responses
+│   │   └── anthropic.py             # State machine streaming (AnthropicStreamState + pending_tool_calls)
+│   ├── models/                      # Pydantic schemas
+│   ├── services/                    # DeepSeek client, model mapper
+│   └── utils/                        # SSE, errors, logging
 ├── config/
-│   ├── model_mapping.yaml     # Model name mapping rules
-│   └── gateway.yaml           # Server/deepseek/logging config
-├── nginx/conf.d/              # Nginx HTTPS config for llm.gorobotic.cn
+│   ├── model_mapping.yaml           # Model name mapping rules + reasoning effort override
+│   └── gateway.yaml                 # Server/deepseek/logging config
+├── nginx/conf.d/                    # Nginx HTTPS config for llm.gorobotic.cn
 ├── Dockerfile
 ├── docker-compose.yml
 └── .env.example
@@ -161,7 +222,7 @@ curl http://localhost:8000/health
 # Test through Nginx
 curl https://llm.gorobotic.cn/health
 
-# Test model listing
+# Test model listing (proxies DeepSeek's models)
 curl https://llm.gorobotic.cn/v1/models \
   -H "Authorization: Bearer YOUR_GATEWAY_KEY"
 ```
@@ -185,7 +246,7 @@ sudo crontab -e
 | 1 | TCP | 22 | 你的IP | SSH 管理 |
 | 2 | TCP | 80 | 0.0.0.0/0 | HTTP (certbot + 重定向) |
 | 3 | TCP | 443 | 0.0.0.0/0 | HTTPS (API 访问) |
-| 4 | TCP | 8000 | 127.0.0.1/32 | 仅本地 (Docker 内部) |
+| 4 | TCP | 8000 | 127.0.0.1/32 | 仅本地 (Docker 内部，不对外暴露) |
 
 ### DNS Configuration (阿里云解析)
 
@@ -203,13 +264,27 @@ sudo crontab -e
 ```bash
 curl https://llm.gorobotic.cn/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
   -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+**OpenAI Chat with tool calling:**
+```bash
+curl https://llm.gorobotic.cn/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
+    "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+  }'
 ```
 
 **OpenAI Responses (with reasoning effort override):**
 ```bash
 curl https://llm.gorobotic.cn/v1/responses \
   -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
   -d '{"model": "gpt-4o", "input": "Solve this problem", "reasoning": {"effort": "high"}}'
 ```
 
@@ -218,20 +293,139 @@ curl https://llm.gorobotic.cn/v1/responses \
 curl https://llm.gorobotic.cn/v1/messages \
   -H "x-api-key: YOUR_KEY" \
   -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
   -d '{"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 1024}'
 ```
 
-**For Claude Code, set these environment variables:**
+**Anthropic with tool use:**
+```bash
+curl https://llm.gorobotic.cn/v1/messages \
+  -H "x-api-key: YOUR_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "tools": [{"name": "get_weather", "description": "Get weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+    "messages": [{"role": "user", "content": "What is the weather in Beijing?"}]
+  }'
+```
+
+**Client Environment Variables:**
+
+For Claude Code:
 ```bash
 export ANTHROPIC_BASE_URL=https://llm.gorobotic.cn
 export ANTHROPIC_API_KEY=YOUR_KEY
 ```
 
-**For Codex/OpenAI tools:**
+For Codex/OpenAI tools:
 ```bash
 export OPENAI_BASE_URL=https://llm.gorobotic.cn/v1
 export OPENAI_API_KEY=YOUR_KEY
 ```
+
+For Xcode Agent (uses OpenAI Chat API with content arrays and tool calls):
+```bash
+# Configure in Xcode's model settings
+# Base URL: https://llm.gorobotic.cn/v1
+# API Key: YOUR_KEY
+# Model: gpt-4o (or any model name from the mapping table)
+```
+
+---
+
+## Local Development & Testing
+
+### Method 1: Direct uvicorn
+
+```bash
+cd /Users/simon.zeng/Documents/Code/deepseek-gateway
+pip3 install -r requirements.txt
+
+# Set env vars
+export DEEPSEEK_API_KEY=sk-your-deepseek-key
+# Optionally set GATEWAY_API_KEY for gateway auth mode
+
+# Run
+PYTHONPATH=. uvicorn app.main:app --reload --port 8000
+```
+
+### Method 2: Docker Compose
+
+```bash
+cd /Users/simon.zeng/Documents/Code/deepseek-gateway
+
+# Create .env
+cp .env.example .env
+# Edit .env with your DEEPSEEK_API_KEY
+
+docker compose up --build
+```
+
+### Test Endpoints
+
+```bash
+# Health
+curl http://localhost:8000/health
+
+# List models (proxies DeepSeek)
+curl http://localhost:8000/v1/models -H "Authorization: Bearer YOUR_KEY"
+
+# OpenAI Chat
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+
+# Anthropic
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: YOUR_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}'
+```
+
+---
+
+## Version History
+
+### v1 — Initial Build
+- Three-protocol gateway: OpenAI Chat, OpenAI Responses, Anthropic Messages
+- SSE streaming with state machine
+- Configurable model mapping via YAML
+- Hybrid auth (gateway key / key forwarding)
+
+### v2 — Domain & Model Updates
+- Domain: `model.gorobotic.cn` → `llm.gorobotic.cn`
+- Model names: `deepseek-chat` → `deepseek-v4-flash`, `deepseek-reasoner` → `deepseek-v4-pro`
+- Mapping: OpenAI turbo → Pro, Anthropic opus → Pro
+- Reasoning effort override: `effort ≥ "high"` → force Pro
+- Alibaba Cloud ECS deployment config
+
+### v3 — Models Endpoint & Auth Refactor
+- `/v1/models` now proxies DeepSeek's model list directly (instead of returning gateway-defined models)
+- Auth unified: all routers use `Depends(verify_api_key)` from `app/dependencies.py`
+- Removed duplicated `_resolve_api_key()` from individual routers
+
+### v4 — Xcode Agent Compatibility
+- **Content type fixes**:
+  - Content arrays (`[{"type": "text", "text": "..."}]`) → flattened to strings
+  - `image_url` parts → discarded (DeepSeek is text-only)
+  - `tool` role messages → content flattened to string
+- **Tool calls support (OpenAI Chat)**:
+  - `tool_calls`, `tool_call_id`, `name` fields preserved in request conversion
+  - `tools` and `tool_choice` definitions passed through to DeepSeek
+- **Tool use support (Anthropic)**:
+  - Request: `tool_use` blocks → `tool_calls` field, `tool_result` blocks → `tool` role messages
+  - Request: Anthropic tool definitions (`input_schema`) → OpenAI format (`parameters`)
+  - Request: Anthropic `tool_choice` → DeepSeek `tool_choice` mapping
+  - Response: `tool_calls` → `tool_use` content blocks
+  - Response: `finish_reason: "tool_calls"` → `stop_reason: "tool_use"`
+- **Streaming tool calls (Anthropic)**:
+  - `pending_tool_calls` dict in `AnthropicStreamState` for accumulating incremental tool call deltas
+  - `content_block_start` (tool_use) + `input_json_delta` → streaming tool call output
+- **Anthropic thinking budget**: `thinking.budget_tokens ≥ 10000` triggers Pro model override (like `reasoning.effort`)
 
 ---
 

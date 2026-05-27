@@ -11,10 +11,19 @@ from pydantic import BaseModel, Field
 
 
 class DeepSeekMessage(BaseModel):
-    """A single message in the DeepSeek chat format."""
+    """A single message in the DeepSeek chat format.
+
+    Supports all OpenAI message roles:
+    - system, user, assistant: content is string
+    - assistant with tool_calls: tool_calls list + optional content
+    - tool (result): tool_call_id + content (string)
+    """
 
     role: str
     content: Optional[str] = None
+    name: Optional[str] = None
+    tool_calls: Optional[list[dict]] = None
+    tool_call_id: Optional[str] = None
     reasoning_content: Optional[str] = Field(None, exclude=True)  # Strip from outgoing
 
     model_config = {"extra": "allow"}

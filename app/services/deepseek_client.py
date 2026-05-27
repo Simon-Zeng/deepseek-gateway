@@ -120,6 +120,24 @@ class DeepSeekClient:
         async for chunk in parse_sse_stream(response):
             yield chunk
 
+    async def list_models(self, api_key: str) -> dict[str, Any]:
+        """Fetch available models from the DeepSeek API.
+
+        Args:
+            api_key: API key to use for authentication.
+
+        Returns:
+            The raw JSON response from DeepSeek's /models endpoint.
+            Example: {"object": "list", "data": [{"id": "deepseek-v4-flash", ...}]}
+        """
+        headers = self._build_headers(api_key)
+        response = await self._request_with_retry(
+            "GET",
+            "/models",
+            headers=headers,
+        )
+        return response.json()
+
     def _build_headers(self, api_key: str) -> dict[str, str]:
         """Build request headers with API key."""
         return {
