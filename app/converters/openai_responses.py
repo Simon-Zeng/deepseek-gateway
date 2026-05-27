@@ -69,6 +69,10 @@ def _convert_input_item(item, messages: list):
             logger.warning("Unexpected input item type '%s', treating as message", item_type)
 
         role = item.get("role", "user")
+        # Responses API uses "developer" role — map to "system" for Chat API
+        if role == "developer":
+            role = "system"
+
         content = _flatten_content(item.get("content"))
         tool_calls = item.get("tool_calls")
         tool_call_id = item.get("tool_call_id")
@@ -76,6 +80,10 @@ def _convert_input_item(item, messages: list):
     elif hasattr(item, "role"):
         # Pydantic model (ResponseInputMessage)
         role = item.role
+        # Responses API uses "developer" role — map to "system" for Chat API
+        if role == "developer":
+            role = "system"
+
         content = _flatten_content(item.content)
         tool_calls = getattr(item, "tool_calls", None)
         tool_call_id = getattr(item, "tool_call_id", None)
