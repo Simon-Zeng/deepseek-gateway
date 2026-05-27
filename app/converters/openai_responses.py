@@ -51,7 +51,8 @@ def _flatten_content(content) -> Optional[str]:
                     text_parts.append(part["text"])
         return "\n".join(text_parts) if text_parts else None
 
-    # Fallback
+    # Fallback — should not normally be reached
+    logger.warning("Unexpected content type %s, falling back to str()", type(content).__name__)
     return str(content) if content else None
 
 
@@ -62,6 +63,11 @@ def _convert_input_item(item, messages: list):
     function calling conversations.
     """
     if isinstance(item, dict):
+        # Warn about non-message item types (e.g., function_call_output)
+        item_type = item.get("type")
+        if item_type and item_type != "message":
+            logger.warning("Unexpected input item type '%s', treating as message", item_type)
+
         role = item.get("role", "user")
         content = _flatten_content(item.get("content"))
         tool_calls = item.get("tool_calls")
@@ -125,26 +131,16 @@ def convert_request(
         for item in request.input:
             _convert_input_item(item, messages)
 
-    # Log summary for debugging
-    msg_roles = [f"{m.role}({len(m.content) if m.content else 0}c)" for m in messages]
-    logger.info(
-        "Converted %d messages [%s], %d tools for DeepSeek (model=%s, stream=%s, max_tokens=%s)",
-        len(messages),
-        ", ".join(msg_roles),
-        len(converted_tools) if converted_tools else 0,
-        target_model,
-        request.stream,
-        request.max_output_tokens,
-    )
-
     # Log warnings for unsupported features
     if request.previous_response_id:
         logger.warning("previous_response_id not supported, ignoring")
+
     # Convert tools from Responses API format to Chat Completions format
     # Responses API: {type: "function", name: "...", description: "...", input_schema: {...}}
     # Chat Completions: {type: "function", function: {name: "...", description: "...", parameters: {...}}}
     converted_tools = None
     converted_tool_choice = None
+
     if request.tools:
         converted_tools = []
         for tool in request.tools:
@@ -191,6 +187,18 @@ def convert_request(
                 converted_tool_choice = request.tool_choice
 
         logger.info("Converted %d tools for DeepSeek", len(converted_tools) if converted_tools else 0)
+
+    # Log summary for debugging
+    msg_roles = [f"{m.role}({len(m.content) if m.content else 0}c)" for m in messages]
+    logger.info(
+        "Converted %d messages [%s], %d tools for DeepSeek (model=%s, stream=%s, max_tokens=%s)",
+        len(messages),
+        ", ".join(msg_roles),
+        len(converted_tools) if converted_tools else 0,
+        target_model,
+        request.stream,
+        request.max_output_tokens,
+    )
 
     return DeepSeekRequest(
         model=target_model,
