@@ -1,0 +1,88 @@
+# Default target models
+defaults:
+  chat: deepseek-v4-flash
+  reasoner: deepseek-v4-pro
+
+# Model name mapping rules (evaluated top to bottom, first match wins)
+mapping:
+  # ── OpenAI models ──
+  # Reasoning models -> deepseek-v4-pro
+  - pattern: "^o[13](-mini|-preview)?$"
+    target: deepseek-v4-pro
+    type: reasoner
+
+  # Turbo models -> deepseek-v4-pro
+  - pattern: "^gpt-3\\.5-turbo(-\\d{4})?$"
+    target: deepseek-v4-pro
+    type: reasoner
+  - pattern: "^gpt-4-turbo$"
+    target: deepseek-v4-pro
+    type: reasoner
+
+  # Other GPT models -> deepseek-v4-flash
+  - pattern: "^gpt-4o(-\\d{4}-\\d{2}-\\d{2})?$"
+    target: deepseek-v4-flash
+    type: chat
+  - pattern: "^gpt-4(-\\d{4})?$"
+    target: deepseek-v4-flash
+    type: chat
+
+  # ── Anthropic models ──
+  # Opus models -> deepseek-v4-pro
+  - pattern: "^claude-3[.-]opus(-\\d{8})?$"
+    target: deepseek-v4-pro
+    type: reasoner
+  - pattern: "^claude-opus-4(-\\d{8})?$"
+    target: deepseek-v4-pro
+    type: reasoner
+  - pattern: "^claude-opus-4-latest$"
+    target: deepseek-v4-pro
+    type: reasoner
+
+  # Other Claude models -> deepseek-v4-flash
+  - pattern: "^claude-3[.-]5-sonnet(-\\d{8})?$"
+    target: deepseek-v4-flash
+    type: chat
+  - pattern: "^claude-3[.-]haiku(-\\d{8})?$"
+    target: deepseek-v4-flash
+    type: chat
+  - pattern: "^claude-sonnet-4(-\\d{8})?$"
+    target: deepseek-v4-flash
+    type: chat
+  - pattern: "^claude-3-5-sonnet-latest$"
+    target: deepseek-v4-flash
+    type: chat
+  - pattern: "^claude-sonnet-4-latest$"
+    target: deepseek-v4-flash
+    type: chat
+
+  # ── DeepSeek models pass through ──
+  - pattern: "^deepseek-v4-(flash|pro)$"
+    target: "$0"
+    type: auto
+  # Legacy names for backward compatibility
+  - pattern: "^deepseek-chat$"
+    target: deepseek-v4-flash
+    type: chat
+  - pattern: "^deepseek-reasoner$"
+    target: deepseek-v4-pro
+    type: reasoner
+
+  # Catch-all: unknown models default to deepseek-v4-flash
+  - pattern: ".*"
+    target: deepseek-v4-flash
+    type: chat
+
+# Reasoning effort override: when reasoning effort >= threshold, force use pro model
+reasoning_effort_override:
+  enabled: true
+  # Effort levels that trigger pro model: "high" and above
+  # Valid effort values: "low", "medium", "high"
+  threshold: "high"
+
+# Anthropic extended thinking: which DeepSeek models trigger thinking blocks
+thinking:
+  models:
+    - deepseek-v4-pro
+  # Minimum reasoning_content length (chars) to include thinking block
+  min_length: 0
