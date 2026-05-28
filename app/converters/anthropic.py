@@ -71,7 +71,7 @@ def convert_request(
 
         # Check if message contains tool_use blocks (assistant role)
         # Anthropic puts tool calls inside content array; DeepSeek uses tool_calls field
-        tool_calls, text_content = _extract_tool_calls_and_text(msg.content)
+        tool_calls, text_content, reasoning = _extract_tool_calls_and_text(msg.content)
 
         if tool_calls:
             # Assistant message with tool calls → DeepSeek format
@@ -81,11 +81,16 @@ def convert_request(
             # tool_use blocks, which DeepSeek does not accept).
             if text_content:
                 logger.debug("Discarding text content from tool_calls message (DeepSeek requires content=null)")
-            messages.append(DeepSeekMessage(
+            ds_msg = DeepSeekMessage(
                 role=role,
                 content=None,
                 tool_calls=tool_calls,
-            ))
+            )
+            # In thinking mode, DeepSeek requires reasoning_content to be passed
+            # back verbatim in multi-turn conversations.
+            if reasoning:
+                ds_msg.reasoning_content = reasoning
+            messages.append(ds_msg)
         elif role == "user" and _has_tool_result(msg.content):
             # User message with tool_result → DeepSeek tool role messages
             for tc_msg in _convert_tool_results(msg.content):
@@ -238,25 +243,32 @@ def convert_response(
     )
 
 
-def _extract_tool_calls_and_text(content) -> tuple[Optional[list[dict]], Optional[str]]:
-    """Extract tool_calls and text from Anthropic content array.
+def _extract_tool_calls_and_text(content) -> tuple[Optional[list[dict]], Optional[str], Optional[str]]:
+    """Extract tool_calls, text, and reasoning from Anthropic content array.
 
-    Anthropic puts tool_use inside content blocks:
-        [{"type": "tool_use", "id": "...", "name": "...", "input": {...}}]
-    DeepSeek uses the tool_calls field:
-        {"tool_calls": [{"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}]}
+    Anthropic puts tool_use and thinking inside content blocks:
+        [{"type": "thinking", "thinking": "..."},
+         {"type": "tool_use", "id": "...", "name": "...", "input": {...}}]
+    DeepSeek uses the tool_calls field and reasoning_content field:
+        {"tool_calls": [{"id": "...", "type": "function", "function": {...}}],
+         "reasoning_content": "..."}
+
+    In thinking mode, DeepSeek requires ``reasoning_content`` to be passed
+    back verbatim in multi-turn conversations. We extract it from the
+    ``thinking`` blocks and return it as the third element.
 
     Returns:
-        Tuple of (tool_calls list or None, text content or None)
+        Tuple of (tool_calls list or None, text content or None, reasoning text or None)
     """
     if content is None or isinstance(content, str):
-        return None, content
+        return None, content, None
 
     if not isinstance(content, list):
-        return None, _extract_text_content(content)
+        return None, _extract_text_content(content), None
 
     tool_calls = []
     text_parts = []
+    reasoning_parts = []
 
     for block in content:
         if isinstance(block, dict):
@@ -277,8 +289,9 @@ def _extract_tool_calls_and_text(content) -> tuple[Optional[list[dict]], Optiona
             elif block_type == "text":
                 text_parts.append(block.get("text", ""))
             elif block_type == "thinking":
-                # Skip thinking blocks from previous messages
-                pass
+                # Extract reasoning text to pass back to DeepSeek
+                if "thinking" in block:
+                    reasoning_parts.append(block["thinking"])
             elif block_type == "signature":
                 # Skip signature blocks (extended thinking verification)
                 pass
@@ -288,7 +301,8 @@ def _extract_tool_calls_and_text(content) -> tuple[Optional[list[dict]], Optiona
             text_parts.append(block)
 
     text = "\n".join(text_parts) if text_parts else None
-    return (tool_calls if tool_calls else None), text
+    reasoning = "\n".join(reasoning_parts) if reasoning_parts else None
+    return (tool_calls if tool_calls else None), text, reasoning
 
 
 def _has_tool_result(content) -> bool:
