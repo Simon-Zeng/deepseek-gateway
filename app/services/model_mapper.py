@@ -23,6 +23,7 @@ REASONING_EFFORT_TO_DEEPSEEK = {
     "low": "low",       # Direct mapping
     "medium": "high",   # DeepSeek has no "medium" — map up one level
     "high": "high",     # Direct mapping
+    "xhigh": "high",    # Codex/OpenAI extended effort — map to DeepSeek high
     "max": "high",      # Anthropic Opus-only — map to highest DeepSeek value
 }
 

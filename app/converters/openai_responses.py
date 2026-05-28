@@ -67,6 +67,25 @@ def _flatten_content(content) -> Optional[str]:
 
 
 
+def _get_item_attr(item, key, default=None):
+    """Get an attribute from a dict or Pydantic model.
+
+    When Pydantic parses the ``input`` list of a ResponsesRequest, items
+    with ``type: "function_call"`` or ``type: "function_call_output"`` are
+    still coerced into ``ResponseInputMessage`` models (because the union
+    type includes ``list[ResponseInputMessage]`` and ``extra="allow"``).
+    The original ``type``, ``call_id``, ``name``, ``arguments`` etc. are
+    preserved as extra fields accessible via ``getattr()``.
+
+    This helper abstracts the difference between dicts and Pydantic models
+    so that ``_convert_input_item`` can handle both uniformly.
+    """
+    if isinstance(item, dict):
+        return item.get(key, default)
+    # Pydantic model — try getattr (covers model fields + extra fields)
+    return getattr(item, key, default)
+
+
 def _convert_input_item(item, messages: list):
     """Convert a single input item (dict or Pydantic model) to DeepSeekMessage(s).
 
@@ -75,85 +94,78 @@ def _convert_input_item(item, messages: list):
     - "function_call": assistant tool call → DeepSeek tool_calls format
     - "function_call_output": tool result → DeepSeek tool role message
 
-    Preserves tool_calls, tool_call_id, and name fields for multi-turn
-    function calling conversations.
+    Works with both raw dicts and Pydantic ``ResponseInputMessage`` models.
+    When Pydantic parses the ``input`` list, items with ``type: "function_call"``
+    or ``type: "function_call_output"`` are still coerced into
+    ``ResponseInputMessage`` models (extra fields preserved via ``extra="allow"``).
+    We use ``_get_item_attr()`` to abstract dict vs model access.
     """
-    if isinstance(item, dict):
-        item_type = item.get("type")
+    item_type = _get_item_attr(item, "type")
 
-        # ── function_call: assistant tool call ──
-        # Responses API: {"type": "function_call", "id": "call_xxx", "call_id": "call_xxx",
-        #                 "name": "func_name", "arguments": "{...}"}
-        # DeepSeek: {"role": "assistant", "tool_calls": [{"id": "call_xxx", "type": "function",
-        #             "function": {"name": "func_name", "arguments": "{...}"}}]}
-        if item_type == "function_call":
-            call_id = item.get("call_id")
-            if call_id is None:
-                call_id = item.get("id", "")
-            func_name = item.get("name", "")
-            arguments = item.get("arguments", "")
-            # Ensure arguments is a string
-            if isinstance(arguments, dict):
-                arguments = json.dumps(arguments, ensure_ascii=False)
+    # ── function_call: assistant tool call ──
+    # Responses API: {"type": "function_call", "id": "call_xxx", "call_id": "call_xxx",
+    #                 "name": "func_name", "arguments": "{...}"}
+    # DeepSeek: {"role": "assistant", "tool_calls": [{"id": "call_xxx", "type": "function",
+    #             "function": {"name": "func_name", "arguments": "{...}"}}]}
+    if item_type == "function_call":
+        call_id = _get_item_attr(item, "call_id")
+        if call_id is None:
+            call_id = _get_item_attr(item, "id", "")
+        func_name = _get_item_attr(item, "name", "")
+        arguments = _get_item_attr(item, "arguments", "")
+        # Ensure arguments is a string
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False)
 
-            messages.append(DeepSeekMessage(
-                role="assistant",
-                content=None,
-                tool_calls=[{
-                    "id": to_call(call_id),
-                    "type": "function",
-                    "function": {
-                        "name": func_name,
-                        "arguments": arguments,
-                    },
-                }],
-            ))
-            return
-
-        # ── function_call_output: tool result ──
-        # Responses API: {"type": "function_call_output", "call_id": "call_xxx", "output": "result text"}
-        # DeepSeek: {"role": "tool", "tool_call_id": "call_xxx", "content": "result text"}
-        if item_type == "function_call_output":
-            call_id = item.get("call_id", "")
-            output = item.get("output", "")
-            # output can be a string or a dict — flatten to string for DeepSeek
-            if isinstance(output, dict):
-                output = json.dumps(output, ensure_ascii=False)
-
-            messages.append(DeepSeekMessage(
-                role="tool",
-                tool_call_id=to_call(call_id),
-                content=output,
-            ))
-            return
-
-        # ── Regular message type ──
-        if item_type and item_type != "message":
-            logger.warning("Unexpected input item type '%s', treating as message", item_type)
-
-        role = item.get("role", "user")
-        # Responses API uses "developer" role — map to "system" for Chat API
-        if role == "developer":
-            role = "system"
-
-        content = _flatten_content(item.get("content"))
-        tool_calls = item.get("tool_calls")
-        tool_call_id = item.get("tool_call_id")
-        name = item.get("name")
-    elif hasattr(item, "role"):
-        # Pydantic model (ResponseInputMessage)
-        role = item.role
-        # Responses API uses "developer" role — map to "system" for Chat API
-        if role == "developer":
-            role = "system"
-
-        content = _flatten_content(item.content)
-        tool_calls = getattr(item, "tool_calls", None)
-        tool_call_id = getattr(item, "tool_call_id", None)
-        name = getattr(item, "name", None)
-    else:
-        logger.warning("Unknown input item type, skipping: %s", type(item).__name__)
+        messages.append(DeepSeekMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[{
+                "id": to_call(call_id),
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": arguments,
+                },
+            }],
+        ))
         return
+
+    # ── function_call_output: tool result ──
+    # Responses API: {"type": "function_call_output", "call_id": "call_xxx", "output": "result text"}
+    # DeepSeek: {"role": "tool", "tool_call_id": "call_xxx", "content": "result text"}
+    if item_type == "function_call_output":
+        call_id = _get_item_attr(item, "call_id", "")
+        output = _get_item_attr(item, "output", "")
+        # output can be a string or a dict — flatten to string for DeepSeek
+        if isinstance(output, dict):
+            output = json.dumps(output, ensure_ascii=False)
+
+        messages.append(DeepSeekMessage(
+            role="tool",
+            tool_call_id=to_call(call_id),
+            content=output,
+        ))
+        return
+
+    # ── reasoning: skip (DeepSeek doesn't accept reasoning in input) ──
+    if item_type == "reasoning":
+        logger.debug("Skipping reasoning input item (not supported by DeepSeek)")
+        return
+
+    # ── Regular message type ──
+    if item_type and item_type not in ("message", None):
+        logger.warning("Unexpected input item type '%s', treating as message", item_type)
+
+    role = _get_item_attr(item, "role", "user")
+    # Responses API uses "developer" role — map to "system" for Chat API
+    if role == "developer":
+        role = "system"
+
+    content = _flatten_content(_get_item_attr(item, "content"))
+    tool_calls = _get_item_attr(item, "tool_calls")
+    tool_call_id = _get_item_attr(item, "tool_call_id")
+    name = _get_item_attr(item, "name")
 
     # Build the message
     msg = DeepSeekMessage(role=role, content=content)
