@@ -77,10 +77,10 @@ class DeepSeekClient:
         payload = request.model_dump(exclude_none=True, mode="json")
         # Ensure stream is False for non-streaming
         payload["stream"] = False
-        # DeepSeek requires content field on all messages (even assistant tool_calls)
+        # DeepSeek requires content field on all messages — null is not accepted
         for msg in payload.get("messages", []):
             if "content" not in msg:
-                msg["content"] = None
+                msg["content"] = ""
 
         headers = self._build_headers(api_key)
 
@@ -109,10 +109,10 @@ class DeepSeekClient:
         """
         payload = request.model_dump(exclude_none=True, mode="json")
         payload["stream"] = True
-        # DeepSeek requires content field on all messages (even assistant tool_calls)
+        # DeepSeek requires content field on all messages — null is not accepted
         for msg in payload.get("messages", []):
             if "content" not in msg:
-                msg["content"] = None
+                msg["content"] = ""
 
         headers = self._build_headers(api_key)
         # For streaming, we need to read the response as it comes
