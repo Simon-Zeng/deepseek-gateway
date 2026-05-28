@@ -25,7 +25,9 @@ from app.models.anthropic import (
     TextResponseBlock,
     ThinkingResponseBlock,
 )
+from app.services.model_mapper import map_reasoning_effort
 from app.utils.sse import generate_id
+from app.utils.tool_call_ids import to_toolu, to_call
 
 logger = logging.getLogger(__name__)
 
@@ -62,18 +64,29 @@ def convert_request(
 
     # Convert messages
     for msg in request.messages:
+        # Map role: Anthropic uses "developer" but DeepSeek expects "system"
+        role = msg.role
+        if role == "developer":
+            role = "system"
+
         # Check if message contains tool_use blocks (assistant role)
         # Anthropic puts tool calls inside content array; DeepSeek uses tool_calls field
         tool_calls, text_content = _extract_tool_calls_and_text(msg.content)
 
         if tool_calls:
             # Assistant message with tool calls → DeepSeek format
+            # DeepSeek expects tool_calls messages to have content: null.
+            # If text_content is non-empty, log it so the info isn't lost
+            # but don't include it (some Anthropic clients send text alongside
+            # tool_use blocks, which DeepSeek does not accept).
+            if text_content:
+                logger.debug("Discarding text content from tool_calls message (DeepSeek requires content=null)")
             messages.append(DeepSeekMessage(
-                role=msg.role,
-                content=text_content,
+                role=role,
+                content=None,
                 tool_calls=tool_calls,
             ))
-        elif msg.role == "user" and _has_tool_result(msg.content):
+        elif role == "user" and _has_tool_result(msg.content):
             # User message with tool_result → DeepSeek tool role messages
             for tc_msg in _convert_tool_results(msg.content):
                 messages.append(tc_msg)
@@ -81,7 +94,7 @@ def convert_request(
             # Regular message — flatten content to string
             content = _extract_text_content(msg.content)
             messages.append(DeepSeekMessage(
-                role=msg.role,
+                role=role,
                 content=content,
             ))
 
@@ -89,17 +102,58 @@ def convert_request(
     # Convert Anthropic tool definitions to OpenAI format if present
     deepseek_tools = _convert_tools(request.tools) if request.tools else None
 
-    return DeepSeekRequest(
+    deepseek_req = DeepSeekRequest(
         model=target_model,
         messages=messages,
         temperature=request.temperature,
         top_p=request.top_p,
         max_tokens=request.max_tokens,
         stream=request.stream,
-        stop=request.stop_sequences,
+        stop=request.stop_sequences if request.stop_sequences else None,
         tools=deepseek_tools,
         tool_choice=_convert_tool_choice(request.tool_choice) if deepseek_tools else None,
     )
+
+    # ── Forward thinking config to DeepSeek ──
+    # Anthropic has two thinking formats (both in model_extra since Pydantic
+    # doesn't define them as formal fields):
+    #
+    # Old format (deprecated on Opus 4.7):
+    #   thinking: {"type": "enabled", "budget_tokens": <int>}
+    #
+    # New format (recommended for all Opus 4.6+ and Sonnet 4.6+):
+    #   thinking: {"type": "adaptive"}
+    #   output_config: {"effort": "low"|"medium"|"high"|"max"}
+    extra = request.model_extra or {}
+    thinking_config = extra.get("thinking")
+    if isinstance(thinking_config, dict):
+        thinking_type = thinking_config.get("type")
+        if thinking_type == "enabled":
+            # Old format: determine effort from budget_tokens
+            budget = thinking_config.get("budget_tokens", 0)
+            raw_effort = "high" if budget >= 10000 else "low"
+            ds_effort = map_reasoning_effort(raw_effort)
+            deepseek_req.reasoning_effort = ds_effort
+            deepseek_req.thinking = {"type": "enabled"}
+            logger.debug(
+                "Forwarded Anthropic thinking (enabled, budget=%d) -> "
+                "DeepSeek reasoning_effort=%s",
+                budget, ds_effort,
+            )
+        elif thinking_type == "adaptive":
+            # New format: extract effort from output_config (top-level extra)
+            output_config = extra.get("output_config", {})
+            raw_effort = output_config.get("effort", "high") if isinstance(output_config, dict) else "high"
+            ds_effort = map_reasoning_effort(raw_effort)
+            deepseek_req.reasoning_effort = ds_effort
+            deepseek_req.thinking = {"type": "enabled"}
+            logger.debug(
+                "Forwarded Anthropic thinking (adaptive) + output_config.effort=%s -> "
+                "DeepSeek reasoning_effort=%s",
+                raw_effort, ds_effort,
+            )
+
+    return deepseek_req
 
 
 def convert_response(
@@ -143,7 +197,7 @@ def convert_response(
         # Add tool_use blocks from DeepSeek tool_calls
         if message.tool_calls:
             for tc in message.tool_calls:
-                tc_id = tc.get("id", f"toolu_{generate_id()}")
+                tc_id = to_toolu(tc.get("id", ""))
                 tc_function = tc.get("function", {})
                 tc_name = tc_function.get("name", "")
                 tc_input = tc_function.get("arguments", {})
@@ -209,12 +263,15 @@ def _extract_tool_calls_and_text(content) -> tuple[Optional[list[dict]], Optiona
             block_type = block.get("type", "")
             if block_type == "tool_use":
                 # Convert Anthropic tool_use → OpenAI tool_calls format
+                # Normalize the ID: Anthropic toolu_ → DeepSeek call_
+                ds_id = to_call(block.get("id", ""))
+
                 tool_calls.append({
-                    "id": block.get("id", f"call_{generate_id()}"),
+                    "id": ds_id,
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
-                        "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
                     },
                 })
             elif block_type == "text":
@@ -251,31 +308,62 @@ def _convert_tool_results(content) -> list[DeepSeekMessage]:
         {"role": "tool", "tool_call_id": "...", "content": "result text"}
 
     There can be multiple tool_results in a single user message.
+
+    If text blocks are interleaved with tool_result blocks, the text is
+    appended to the nearest tool_result's content (preceding the tool_result).
+    This avoids inserting user messages between tool messages, which would
+    violate DeepSeek API ordering constraints.
     """
     results = []
     if not isinstance(content, list):
         return results
 
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "tool_result":
-            tool_use_id = block.get("tool_use_id", "")
-            # Extract text from result content
-            result_content = block.get("content")
-            result_text = _extract_text_content(result_content)
+    # First pass: collect all tool_results and text blocks
+    tool_results = []
+    pending_text_parts = []
 
-            results.append(DeepSeekMessage(
-                role="tool",
-                tool_call_id=tool_use_id,
-                content=result_text,
-            ))
-        elif isinstance(block, dict) and block.get("type") == "text":
-            # Regular text in between tool results — include as user message
-            text = block.get("text", "")
-            if text:
-                results.append(DeepSeekMessage(
-                    role="user",
-                    content=text,
+    for block in content:
+        if isinstance(block, str):
+            # Raw string block — treat as text
+            if block.strip():
+                pending_text_parts.append(block)
+        elif isinstance(block, dict):
+            block_type = block.get("type")
+            if block_type == "tool_result":
+                # Any pending text gets appended to the previous tool_result
+                # or prepended to this one
+                tool_use_id = to_call(block.get("tool_use_id") or "")
+
+                result_content = block.get("content")
+                result_text = _extract_text_content(result_content) or ""
+
+                # If there's pending text, prepend it to this tool result
+                if pending_text_parts:
+                    prefix = "\n".join(pending_text_parts)
+                    result_text = f"{prefix}\n{result_text}" if result_text else prefix
+                    pending_text_parts = []
+
+                tool_results.append(DeepSeekMessage(
+                    role="tool",
+                    tool_call_id=tool_use_id,
+                    content=result_text,
                 ))
+            elif block_type == "text":
+                # Accumulate text — will be merged with adjacent tool_result
+                text = block.get("text", "")
+                if text:
+                    pending_text_parts.append(text)
+
+    # Any remaining text after all tool_results → append as user message
+    # This must come after all tool messages per DeepSeek API constraints
+    if pending_text_parts:
+        results.append(DeepSeekMessage(
+            role="user",
+            content="\n".join(pending_text_parts),
+        ))
+
+    # All tool results come first, then any trailing user message
+    results = tool_results + results
 
     return results
 
@@ -345,6 +433,10 @@ def _convert_tool_choice(tool_choice) -> Optional[dict | str]:
 def _extract_text_content(content) -> Optional[str]:
     """Extract text content from Anthropic-style content (string or block array).
 
+    NOTE: This function should only be called for messages that do NOT contain
+    tool_result blocks. For messages with tool_result, use _convert_tool_results()
+    instead. This function skips tool_result and tool_use blocks explicitly.
+
     Args:
         content: A string, list of content blocks, or None.
 
@@ -365,22 +457,19 @@ def _extract_text_content(content) -> Optional[str]:
                 if block_type == "text":
                     text_parts.append(block.get("text", ""))
                 elif block_type == "tool_result":
-                    # Extract text from tool result content
-                    result_content = block.get("content")
-                    if isinstance(result_content, str):
-                        text_parts.append(result_content)
-                    elif isinstance(result_content, list):
-                        for sub in result_content:
-                            if isinstance(sub, dict) and sub.get("type") == "text":
-                                text_parts.append(sub.get("text", ""))
-                elif block_type in ("image",):
-                    logger.debug("Discarding image content block (DeepSeek is text-only)")
+                    # Skip — handled separately by _convert_tool_results
+                    pass
                 elif block_type == "tool_use":
-                    # Skip tool_use blocks (handled separately)
+                    # Skip — handled separately by _extract_tool_calls_and_text
                     pass
                 elif block_type == "thinking":
                     # Skip thinking blocks from previous messages
                     pass
+                elif block_type in ("image",):
+                    logger.debug("Discarding image content block (DeepSeek is text-only)")
+                elif "text" in block:
+                    # Unknown block type with text — extract it
+                    text_parts.append(block["text"])
             elif hasattr(block, "type"):
                 # Pydantic model
                 if block.type == "text":

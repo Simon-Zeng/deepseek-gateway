@@ -18,7 +18,7 @@ from app.services.deepseek_client import DeepSeekClient, get_client
 from app.services.model_mapper import ModelMapper, MappingResult
 from app.streamers.openai_chat import stream_openai_chat
 from app.utils.errors import convert_deepseek_error, create_openai_error
-from app.utils.sse import generate_id
+from app.utils.sse import generate_id, format_sse_event, format_sse_done
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +45,11 @@ async def chat_completions(
     mapper: ModelMapper = req.app.state.model_mapper
 
     # ── Model Mapping (with reasoning effort override) ──
-    # Some OpenAI clients send reasoning_effort as an extra field
-    reasoning_effort = None
-    if hasattr(request, "model_extra") and request.model_extra:
+    # Some OpenAI clients send reasoning_effort as an extra field (model_extra)
+    # while newer SDK versions may include it as a formal field.
+    # Check both to ensure forward compatibility.
+    reasoning_effort = getattr(request, "reasoning_effort", None)
+    if reasoning_effort is None and hasattr(request, "model_extra") and request.model_extra:
         reasoning_effort = request.model_extra.get("reasoning_effort")
 
     mapping = mapper.map_model(request.model, reasoning_effort=reasoning_effort)
@@ -119,19 +121,38 @@ async def _handle_streaming(
     # Get the streaming generator from DeepSeek
     deepseek_stream = client.chat_completion_stream(deepseek_request, api_key)
 
-    # Create the converted stream
-    async def response_generator():
-        async for chunk_str in stream_openai_chat(
-            deepseek_stream,
-            original_model=original_model,
-            model_type=mapping.model_type,
-            response_id=response_id,
-            created=created,
-        ):
-            yield chunk_str
+    async def safe_response_generator():
+        """Wrap stream to handle upstream errors gracefully."""
+        emitted = False
+        try:
+            async for chunk_str in stream_openai_chat(
+                deepseek_stream,
+                original_model=original_model,
+                model_type=mapping.model_type,
+                response_id=response_id,
+                created=created,
+            ):
+                emitted = True
+                yield chunk_str
+        except Exception as e:
+            logger.error("Stream error (sending failed completion): %s", e)
+            if not emitted:
+                # Emit a clean error chunk so client doesn't hang
+                yield format_sse_event({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": "error",
+                    }],
+                    "created": created,
+                    "id": response_id,
+                    "model": original_model,
+                    "object": "chat.completion.chunk",
+                })
+            yield format_sse_done()
 
     return StreamingResponse(
-        response_generator(),
+        safe_response_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -102,6 +102,7 @@ class ResponsesResponse(BaseModel):
     model: str
     output: list[Union[ReasoningOutputItem, MessageOutputItem, dict]] = Field(default_factory=list)
     usage: Optional[ResponsesUsage] = None
+    incomplete_details: Optional[dict] = None
     metadata: Optional[dict] = None
 
     model_config = {"extra": "allow"}

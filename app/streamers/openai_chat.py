@@ -74,16 +74,28 @@ async def stream_openai_chat(
                         phase = StreamPhase.REASONING
 
                     if reasoning_mode == "drop":
-                        # Skip this chunk entirely if it only has reasoning
+                        # Skip this chunk's reasoning entirely
+                        # But still check if there's content in the same chunk
                         if not delta.get("content") and not choice.get("finish_reason"):
                             continue
                     elif reasoning_mode == "prepend":
                         # Convert reasoning to content with marker
                         if phase == StreamPhase.REASONING:
-                            delta["content"] = f"{prepend_marker}{reasoning_text}"
+                            # Check if there's also content in this same delta
+                            existing_content = delta.get("content")
+                            if existing_content:
+                                # Both reasoning and content in same chunk — combine
+                                delta["content"] = f"{prepend_marker}{reasoning_text}{existing_content}"
+                            else:
+                                delta["content"] = f"{prepend_marker}{reasoning_text}"
                             phase = StreamPhase.CONTENT
                         else:
-                            delta["content"] = reasoning_text
+                            # Subsequent reasoning after the first — just append as content
+                            existing_content = delta.get("content")
+                            if existing_content:
+                                delta["content"] = f"{reasoning_text}{existing_content}"
+                            else:
+                                delta["content"] = reasoning_text
                     elif reasoning_mode == "custom_field":
                         # Include as non-standard field
                         delta["reasoning_content"] = reasoning_text
@@ -92,6 +104,11 @@ async def stream_openai_chat(
                 if delta.get("content") is not None:
                     if phase == StreamPhase.IDLE:
                         phase = StreamPhase.CONTENT
+
+                # tool_calls pass-through: DeepSeek and OpenAI use the same streaming
+                # format for tool_calls (delta.tool_calls[].index/id/function), so no
+                # conversion is needed — they are preserved in the delta and emitted
+                # with the rest of the chunk after model name replacement above.
 
                 # Track finish
                 if choice.get("finish_reason"):

@@ -30,7 +30,18 @@ class DeepSeekMessage(BaseModel):
 
 
 class DeepSeekRequest(BaseModel):
-    """DeepSeek chat completion request (OpenAI-compatible)."""
+    """DeepSeek chat completion request (OpenAI-compatible).
+
+    Supports both standard OpenAI ChatCompletions parameters and DeepSeek-specific
+    reasoning controls (``thinking`` and ``reasoning_effort``).
+
+    Reasoning control parameters (required to activate chain-of-thought on V4 models):
+        - ``thinking``: ``{"type": "enabled"}`` — enables reasoning
+        - ``reasoning_effort``: ``"low"`` | ``"high"`` | ``"none"`` — controls depth
+          (note: only these three values are accepted by DeepSeek — "medium" is not
+          supported; use ``app.services.model_mapper.map_reasoning_effort()`` to map
+          provider-specific values before setting this field.)
+    """
 
     model: str
     messages: list[DeepSeekMessage]
@@ -47,6 +58,10 @@ class DeepSeekRequest(BaseModel):
     response_format: Optional[dict] = None
     logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
+    seed: Optional[int] = None
+    # ── DeepSeek reasoning controls — mapped from provider-specific formats ──
+    thinking: Optional[dict] = None          # e.g. {"type": "enabled"}
+    reasoning_effort: Optional[str] = None   # "low" | "high" | "none"
 
     model_config = {"extra": "allow"}
 

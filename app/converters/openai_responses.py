@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import logging
 from typing import Optional
@@ -20,7 +21,9 @@ from app.models.openai_responses import (
     ResponsesUsage,
     SummaryText,
 )
+from app.services.model_mapper import map_reasoning_effort
 from app.utils.sse import generate_id
+from app.utils.tool_call_ids import to_call
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,14 @@ def _flatten_content(content) -> Optional[str]:
                 part_type = part.get("type", "")
                 if part_type in ("input_text", "text", "output_text"):
                     text_parts.append(part.get("text", ""))
+                elif part_type == "image_url":
+                    # DeepSeek doesn't support vision — log and skip
+                    logger.debug("Discarding image_url content part (DeepSeek is text-only)")
+                elif part_type == "refusal":
+                    # Treat refusal as text content with a marker to preserve semantics
+                    refusal_text = part.get("refusal", "")
+                    if refusal_text:
+                        text_parts.append(f"[refusal: {refusal_text}]")
                 elif "text" in part:
                     text_parts.append(part["text"])
         return "\n".join(text_parts) if text_parts else None
@@ -56,15 +67,68 @@ def _flatten_content(content) -> Optional[str]:
     return str(content) if content else None
 
 
+
 def _convert_input_item(item, messages: list):
     """Convert a single input item (dict or Pydantic model) to DeepSeekMessage(s).
+
+    Handles these Responses API input item types:
+    - "message": standard user/assistant/system message
+    - "function_call": assistant tool call → DeepSeek tool_calls format
+    - "function_call_output": tool result → DeepSeek tool role message
 
     Preserves tool_calls, tool_call_id, and name fields for multi-turn
     function calling conversations.
     """
     if isinstance(item, dict):
-        # Warn about non-message item types (e.g., function_call_output)
         item_type = item.get("type")
+
+        # ── function_call: assistant tool call ──
+        # Responses API: {"type": "function_call", "id": "call_xxx", "call_id": "call_xxx",
+        #                 "name": "func_name", "arguments": "{...}"}
+        # DeepSeek: {"role": "assistant", "tool_calls": [{"id": "call_xxx", "type": "function",
+        #             "function": {"name": "func_name", "arguments": "{...}"}}]}
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            if call_id is None:
+                call_id = item.get("id", "")
+            func_name = item.get("name", "")
+            arguments = item.get("arguments", "")
+            # Ensure arguments is a string
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+
+            messages.append(DeepSeekMessage(
+                role="assistant",
+                content=None,
+                tool_calls=[{
+                    "id": to_call(call_id),
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "arguments": arguments,
+                    },
+                }],
+            ))
+            return
+
+        # ── function_call_output: tool result ──
+        # Responses API: {"type": "function_call_output", "call_id": "call_xxx", "output": "result text"}
+        # DeepSeek: {"role": "tool", "tool_call_id": "call_xxx", "content": "result text"}
+        if item_type == "function_call_output":
+            call_id = item.get("call_id", "")
+            output = item.get("output", "")
+            # output can be a string or a dict — flatten to string for DeepSeek
+            if isinstance(output, dict):
+                output = json.dumps(output, ensure_ascii=False)
+
+            messages.append(DeepSeekMessage(
+                role="tool",
+                tool_call_id=to_call(call_id),
+                content=output,
+            ))
+            return
+
+        # ── Regular message type ──
         if item_type and item_type != "message":
             logger.warning("Unexpected input item type '%s', treating as message", item_type)
 
@@ -154,6 +218,11 @@ def convert_request(
         for tool in request.tools:
             tool_type = tool.get("type")
             if tool_type == "function":
+                # If already in Chat Completions format, use directly
+                if "function" in tool:
+                    converted_tools.append(tool)
+                    continue
+
                 # Convert from Responses format to Chat Completions format
                 converted_tool = {
                     "type": "function",
@@ -167,9 +236,7 @@ def convert_request(
                     converted_tool["function"]["parameters"] = tool["input_schema"]
                 elif "parameters" in tool:
                     converted_tool["function"]["parameters"] = tool["parameters"]
-                # Map function key if already in that format
-                if "function" in tool:
-                    converted_tool["function"] = tool["function"]
+
                 converted_tools.append(converted_tool)
             elif tool_type == "web_search_preview":
                 logger.warning("web_search_preview tool not supported by DeepSeek, skipping")
@@ -208,7 +275,13 @@ def convert_request(
         request.max_output_tokens,
     )
 
-    return DeepSeekRequest(
+    # Forward response_format from model_extra if present (Responses API supports it
+    # as an extra parameter for JSON mode / structured output)
+    response_format = None
+    if hasattr(request, "model_extra") and request.model_extra:
+        response_format = request.model_extra.get("response_format")
+
+    deepseek_req = DeepSeekRequest(
         model=target_model,
         messages=messages,
         temperature=request.temperature,
@@ -217,7 +290,21 @@ def convert_request(
         stream=request.stream,
         tools=converted_tools if converted_tools else None,
         tool_choice=converted_tool_choice if converted_tools else None,
+        response_format=response_format,
     )
+
+    # ── Forward reasoning.effort to DeepSeek ──
+    if request.reasoning and request.reasoning.effort:
+        ds_effort = map_reasoning_effort(request.reasoning.effort)
+        if ds_effort:
+            deepseek_req.reasoning_effort = ds_effort
+            deepseek_req.thinking = {"type": "enabled"}
+            logger.debug(
+                "Forwarded reasoning.effort=%s -> %s to DeepSeek",
+                request.reasoning.effort, ds_effort,
+            )
+
+    return deepseek_req
 
 
 def convert_response(
@@ -236,10 +323,12 @@ def convert_response(
         ResponsesResponse in OpenAI Responses format.
     """
     output_items = []
+    finish_reason = None
 
     if deepseek_response.choices:
         choice = deepseek_response.choices[0]
         message = choice.message
+        finish_reason = choice.finish_reason
 
         # Add reasoning output item if present (R1 models)
         if is_reasoner and message.reasoning_content:
@@ -249,16 +338,33 @@ def convert_response(
                 summary=[SummaryText(text=message.reasoning_content)],
             ))
 
-        # Add message output item
-        msg_id = generate_id("msg")
-        content_parts = []
-        if message.content:
-            content_parts.append(OutputText(text=message.content))
+        # Add message output item first (before function_call items,
+        # matching streaming output order)
+        if message.content or not message.tool_calls:
+            msg_id = generate_id("msg")
+            content_parts = []
+            if message.content:
+                content_parts.append(OutputText(text=message.content))
 
-        output_items.append(MessageOutputItem(
-            id=msg_id,
-            content=content_parts,
-        ))
+            output_items.append(MessageOutputItem(
+                id=msg_id,
+                content=content_parts,
+            ))
+
+        # Add function_call output items from tool_calls
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                tc_id = to_call(tc.get("id", ""))
+                tc_function = tc.get("function", {})
+                tc_name = tc_function.get("name", "")
+                tc_arguments = tc_function.get("arguments", "")
+                output_items.append({
+                    "type": "function_call",
+                    "id": tc_id,
+                    "call_id": tc_id,
+                    "name": tc_name,
+                    "arguments": tc_arguments,
+                })
 
     # Build usage
     usage = None
@@ -277,6 +383,16 @@ def convert_response(
             total_tokens=deepseek_response.usage.total_tokens,
         )
 
+    # Determine status and incomplete_details from finish_reason
+    status = "completed"
+    incomplete_details = None
+    if finish_reason == "length":
+        status = "incomplete"
+        incomplete_details = {"reason": "max_tokens"}
+    elif finish_reason == "content_filter":
+        status = "incomplete"
+        incomplete_details = {"reason": "content_filter"}
+
     # Ensure ID has resp_ prefix
     resp_id = deepseek_response.id
     if not resp_id.startswith("resp_"):
@@ -288,4 +404,6 @@ def convert_response(
         model=original_model,
         output=output_items,
         usage=usage,
+        status=status,
+        incomplete_details=incomplete_details,
     )

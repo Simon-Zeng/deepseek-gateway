@@ -7,3 +7,8 @@ build/
 .venv/
 *.log
 .DS_Store
+.claude
+.workbuddy
+.codegraph
+.codex
+

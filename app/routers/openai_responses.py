@@ -18,7 +18,7 @@ from app.services.deepseek_client import DeepSeekClient, get_client
 from app.services.model_mapper import ModelMapper, MappingResult
 from app.streamers.openai_responses import stream_openai_responses
 from app.utils.errors import create_openai_error
-from app.utils.sse import generate_id
+from app.utils.sse import generate_id, format_sse_event, format_sse_done
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +70,8 @@ async def responses(
         return await _handle_streaming(client, deepseek_request, api_key, request.model, mapping)
     else:
         return await _handle_non_streaming(client, deepseek_request, api_key, request.model, mapping)
-def _sse_event(data: dict) -> str:
-    """Format a dict as an SSE event string."""
-    import json
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 async def _handle_non_streaming(
     client: DeepSeekClient,
     deepseek_request: DeepSeekRequest,
@@ -118,13 +116,13 @@ async def _handle_streaming(
 
     async def safe_response_generator():
         """Wrap stream to handle upstream errors gracefully."""
-        import json as _json
         emitted = False
         try:
             async for chunk_str in stream_openai_responses(
                 deepseek_stream,
                 original_model=original_model,
                 model_type=mapping.model_type,
+                response_id=response_id,
             ):
                 emitted = True
                 yield chunk_str
@@ -132,11 +130,11 @@ async def _handle_streaming(
             logger.error("Stream error (sending failed completion): %s", e)
             if not emitted:
                 # Emit clean failure events so client doesn't get broken stream
-                yield _sse_event({
+                yield format_sse_event({
                     "type": "response.in_progress",
                     "response": {"id": response_id, "status": "in_progress", "model": original_model, "output": [], "created_at": created_at},
                 })
-                yield _sse_event({
+                yield format_sse_event({
                     "type": "response.completed",
                     "response": {
                         "id": response_id,
@@ -147,7 +145,7 @@ async def _handle_streaming(
                         "error": {"message": str(e), "type": "upstream_error"},
                     },
                 })
-            yield "data: [DONE]\n\n"
+            yield format_sse_done()
 
     return StreamingResponse(
         safe_response_generator(),

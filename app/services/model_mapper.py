@@ -17,6 +17,38 @@ logger = logging.getLogger(__name__)
 # Reasoning effort levels in ascending order of strength
 EFFORT_LEVELS = {"low": 0, "medium": 1, "high": 2, "xhigh": 3}
 
+# Mapping from OpenAI/Anthropic reasoning_effort to DeepSeek format.
+# DeepSeek only accepts: "low", "high", "none" (no "medium").
+REASONING_EFFORT_TO_DEEPSEEK = {
+    "low": "low",       # Direct mapping
+    "medium": "high",   # DeepSeek has no "medium" — map up one level
+    "high": "high",     # Direct mapping
+    "max": "high",      # Anthropic Opus-only — map to highest DeepSeek value
+}
+
+
+def map_reasoning_effort(original_effort: str | None) -> str | None:
+    """Map reasoning effort from OpenAI/Anthropic format to DeepSeek format.
+
+    Provider effort definitions:
+      OpenAI (o-series, GPT-5): low, medium, high
+      Anthropic (adaptive thinking): low, medium, high, max (Opus-only)
+      DeepSeek V4: low, high, none
+
+    The key gap is "medium" — DeepSeek doesn't support it, so "medium" maps to "high".
+    "max" (Anthropic Opus-only) also maps to "high" as DeepSeek's highest level.
+
+    Args:
+        original_effort: The effort value from the incoming request.
+
+    Returns:
+        DeepSeek-compatible effort value, or None if no effort was specified.
+    """
+    if not original_effort:
+        return None
+    normalized = original_effort.strip().lower()
+    return REASONING_EFFORT_TO_DEEPSEEK.get(normalized)
+
 
 class MappingResult(BaseModel):
     """Result of a model name mapping."""
@@ -114,8 +146,13 @@ class ModelMapper:
 
         Args:
             model_name: The model name from the incoming request.
-            reasoning_effort: Optional reasoning effort level ("low", "medium", "high").
-                When effort >= threshold, force use of pro model regardless of mapping.
+            reasoning_effort: Optional reasoning effort level
+                (provider-native values: "low", "medium", "high", "max").
+                When effort >= threshold, force use of pro model regardless of
+                mapping. The actual value-to-DeepSeek conversion (including
+                ``medium→high`` mapping) is done by ``map_reasoning_effort()``
+                in each converter's ``convert_request()`` — this method only
+                uses the raw value for the override decision.
 
         Returns:
             MappingResult with the target DeepSeek model name and type.

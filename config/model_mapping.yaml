@@ -77,7 +77,9 @@ mapping:
 reasoning_effort_override:
   enabled: true
   # Effort levels that trigger pro model: "high" and above
-  # Valid effort values: "low", "medium", "high"
+  # Accepted incoming effort values: "low", "medium", "high", "max"
+  # Note: DeepSeek only accepts "low", "high", "none" — "medium" and "max"
+  # are mapped to "high" by map_reasoning_effort() in model_mapper.py
   threshold: "high"
 
 # Anthropic extended thinking: which DeepSeek models trigger thinking blocks

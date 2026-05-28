@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.dependencies import verify_api_key
@@ -33,7 +33,6 @@ async def anthropic_messages(
     request: AnthropicRequest,
     req: Request,
     api_key: str = Depends(verify_api_key),
-    anthropic_version: Optional[str] = Header(None),
 ):
     """Handle Anthropic Messages API requests.
 
@@ -134,32 +133,58 @@ async def _handle_streaming(
 def _extract_reasoning_effort(request: AnthropicRequest) -> Optional[str]:
     """Extract reasoning effort signal from Anthropic request.
 
-    Anthropic doesn't have an explicit reasoning.effort field, but it uses
-    `thinking.budget_tokens` to control extended thinking. When budget_tokens
-    is set to a high value, we interpret it as "high" reasoning effort.
+    Anthropic has no explicit ``reasoning.effort`` field (unlike OpenAI Responses),
+    but uses a ``thinking`` config block instead. Two formats exist:
 
-    Also checks for a non-standard `reasoning_effort` extra field that some
-    clients may send.
+    Old format (``type: "enabled"`` + ``budget_tokens``):
+      - budget_tokens >= threshold (10000) → returns "high"
+      - budget_tokens > 0                → returns "medium"
+      - (type: "enabled" without budget  → left for converter to handle)
+
+    New format (``type: "adaptive"`` + ``output_config.effort``):
+      - effort = "low"  → returns "low"
+      - effort = "medium" → returns "medium"
+      - effort = "high" → returns "high"
+      - effort = "max"  → returns "max" (Opus-only)
+      - (no effort      → defaults to "high")
+
+    Also checks for a non-standard ``reasoning_effort`` extra field that some
+    clients may send (highest priority).
 
     Returns:
-        "high" if thinking budget is significant, the explicit effort value,
+        The raw Anthropic/OpenAI effort value (low/medium/high/max),
         or None if no reasoning signal is present.
+        This is used upstream for model selection override
+        (``mapper.map_model(reasoning_effort=...)``).
+        The actual value-to-DeepSeek mapping is done inside
+        ``converters.anthropic.convert_request()`` using
+        ``map_reasoning_effort()``.
     """
-    # Check for explicit reasoning_effort field (non-standard but some clients send it)
+    # 1. Check for explicit reasoning_effort field (non-standard but some clients send it)
     extra = request.model_extra or {}
     if "reasoning_effort" in extra:
         return extra["reasoning_effort"]
 
-    # Check thinking configuration
+    # 2. Check thinking configuration
     if "thinking" in extra:
         thinking = extra["thinking"]
         if isinstance(thinking, dict):
-            # If thinking is enabled with type "enabled", treat as at least "medium"
-            if thinking.get("type") == "enabled":
+            ttype = thinking.get("type")
+
+            # Old format: type="enabled" with budget_tokens
+            if ttype == "enabled":
                 budget_tokens = thinking.get("budget_tokens", 0)
                 if budget_tokens >= ANTHROPIC_THINKING_BUDGET_HIGH_THRESHOLD:
                     return "high"
                 elif budget_tokens > 0:
                     return "medium"
+
+            # New format: type="adaptive" — effort is in output_config.effort
+            elif ttype == "adaptive":
+                output_config = extra.get("output_config", {})
+                if isinstance(output_config, dict):
+                    effort = output_config.get("effort", "high")
+                    return effort
+                return "high"
 
     return None

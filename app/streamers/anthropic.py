@@ -11,6 +11,7 @@ from typing import AsyncIterator, Optional
 from app.config import get_settings
 from app.models.common import ModelType
 from app.utils.sse import format_sse_done, format_sse_event, generate_id, format_sse_comment
+from app.utils.tool_call_ids import to_toolu
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ async def stream_anthropic(
                 "model": original_model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 1},
+                "usage": {"input_tokens": 0, "output_tokens": 0},
             },
         },
         event="message_start",
@@ -144,11 +145,29 @@ async def stream_anthropic(
 
     # Clean up: if stream ended without proper finish
     if state.phase != StreamPhase.DONE:
-        if state.phase in (StreamPhase.REASONING, StreamPhase.CONTENT):
+        # Collect all blocks that need closing, sorted by index
+        blocks_to_close: list[tuple[int, str]] = []
+
+        if state.phase == StreamPhase.REASONING:
+            # Close open thinking block
+            blocks_to_close.append((state.content_block_index, "thinking"))
+        elif state.phase == StreamPhase.CONTENT:
+            # Close text block if open
+            if state.text_block_started:
+                blocks_to_close.append((state.content_block_index, "text"))
+
+            # Close any open tool_use blocks
+            for tc_index, tc in sorted(state.pending_tool_calls.items()):
+                if tc.get("started"):
+                    blocks_to_close.append((tc["block_index"], "tool_use"))
+
+        # Emit content_block_stop events in index order
+        for block_index, _block_type in sorted(blocks_to_close):
             yield format_sse_event(
-                {"type": "content_block_stop", "index": state.content_block_index},
+                {"type": "content_block_stop", "index": block_index},
                 event="content_block_stop",
             )
+
         yield format_sse_event(
             {
                 "type": "error",
@@ -209,6 +228,7 @@ async def _handle_tool_calls(state: AnthropicStreamState, tool_calls: list[dict]
             event="content_block_stop",
         )
         state.content_block_index += 1
+        state.text_block_started = False
 
     state.phase = StreamPhase.CONTENT  # Reuse CONTENT phase for tool calls
 
@@ -217,8 +237,9 @@ async def _handle_tool_calls(state: AnthropicStreamState, tool_calls: list[dict]
 
         # Initialize or update tool call data
         if tc_index not in state.pending_tool_calls:
+            normalized_id = to_toolu(tc_delta.get("id", ""))
             state.pending_tool_calls[tc_index] = {
-                "id": tc_delta.get("id", f"toolu_{generate_id()}"),
+                "id": normalized_id,
                 "name": "",
                 "arguments": "",
                 "started": False,
@@ -235,9 +256,9 @@ async def _handle_tool_calls(state: AnthropicStreamState, tool_calls: list[dict]
         if func_delta.get("arguments"):
             tc["arguments"] += func_delta["arguments"]
 
-        # Update ID if present
+        # Update ID if present (normalize to toolu_ format)
         if tc_delta.get("id"):
-            tc["id"] = tc_delta["id"]
+            tc["id"] = to_toolu(tc_delta["id"])
 
         # Emit content_block_start on first chunk for this tool call
         if not tc["started"]:
@@ -320,29 +341,29 @@ async def _handle_finish(
     chunk: dict,
 ) -> AsyncIterator[str]:
     """Handle stream finish."""
-    # Close any open content block
+    # Collect all blocks that need closing, sorted by index
+    blocks_to_close: list[tuple[int, str]] = []  # (index, block_type)
+
     if state.phase == StreamPhase.REASONING:
         # Close thinking block
-        yield format_sse_event(
-            {"type": "content_block_stop", "index": state.content_block_index},
-            event="content_block_stop",
-        )
+        blocks_to_close.append((state.content_block_index, "thinking"))
         state.content_block_index += 1
     elif state.phase == StreamPhase.CONTENT:
         # Close text block if open
         if state.text_block_started:
-            yield format_sse_event(
-                {"type": "content_block_stop", "index": state.content_block_index},
-                event="content_block_stop",
-            )
+            blocks_to_close.append((state.content_block_index, "text"))
 
         # Close any tool_use blocks that are still open
         for tc_index, tc in sorted(state.pending_tool_calls.items()):
             if tc.get("started"):
-                yield format_sse_event(
-                    {"type": "content_block_stop", "index": tc["block_index"]},
-                    event="content_block_stop",
-                )
+                blocks_to_close.append((tc["block_index"], "tool_use"))
+
+    # Emit content_block_stop events in index order
+    for block_index, _block_type in sorted(blocks_to_close):
+        yield format_sse_event(
+            {"type": "content_block_stop", "index": block_index},
+            event="content_block_stop",
+        )
 
     # Map finish_reason
     stop_reason = _map_finish_reason(finish_reason)
