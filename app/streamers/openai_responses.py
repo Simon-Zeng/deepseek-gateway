@@ -119,6 +119,12 @@ async def stream_openai_responses(
             delta = choice.get("delta", {})
             finish_reason = choice.get("finish_reason")
 
+            # Log raw delta for diagnosing text loss (INFO-level for production)
+            if delta:
+                delta_keys = [k for k, v in delta.items() if v is not None]
+                if delta_keys:
+                    logger.info("Stream delta keys: %s", delta_keys)
+
             # Handle reasoning_content
             reasoning_text = delta.get("reasoning_content")
             if reasoning_text is not None:
@@ -211,6 +217,11 @@ async def stream_openai_responses(
                     # Save closed message info for final output reconstruction
                     saved_message_id = message_id
                     saved_message_content = accumulated_content
+                    logger.info(
+                        "Tool_calls closing message: id=%s content_len=%d saved=%r",
+                        saved_message_id, len(saved_message_content),
+                        saved_message_content[:200] if saved_message_content else "''",
+                    )
                     # Reset so subsequent content can start a new message
                     message_emitted = False
                     message_id = f"msg_{generate_id()}"
@@ -280,6 +291,10 @@ async def stream_openai_responses(
             # Handle content
             content_text = delta.get("content")
             if content_text is not None:
+                logger.info(
+                    "Stream content chunk: len=%d phase=%s emitted=%s",
+                    len(content_text), phase, message_emitted,
+                )
                 # Transition from reasoning to content
                 if phase == StreamPhase.REASONING:
                     # Close reasoning
@@ -314,7 +329,10 @@ async def stream_openai_responses(
 
                 elif phase == StreamPhase.TOOL_CALLS:
                     # Content arriving after tool calls — start a new message
-                    # message_emitted was reset by the tool_calls handler
+                    logger.info(
+                        "Content after tool_calls: starting new msg (phase=%s, emitted=%s, saved=%dc)",
+                        phase, message_emitted, len(saved_message_content),
+                    )
                     phase = StreamPhase.CONTENT
                     # A new message_id was already generated
 
@@ -764,4 +782,13 @@ def _build_output_from_items(
                     "arguments": tc["arguments"],
                 })
 
+    logger.info(
+        "Built final output: %d items (saved_msg=%s/%dc cur_msg=%s/%dc pending_tools=%d)",
+        len(output),
+        saved_message_id[-8:] if saved_message_id else "none",
+        len(saved_message_content),
+        message_id[-8:] if message_id else "none",
+        len(content),
+        len(pending_tool_calls),
+    )
     return output
