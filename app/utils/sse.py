@@ -93,6 +93,11 @@ def format_sse_comment(comment: str = "") -> str:
     return f": {comment}\n\n"
 
 
+_id_counter: int = 0
+
+
 def generate_id(prefix: str = "chatcmpl") -> str:
-    """Generate a unique-ish ID for responses."""
-    return f"{prefix}-{int(time.time() * 1000)}"
+    """Generate a unique-ish ID for responses with counter to avoid collisions."""
+    global _id_counter
+    _id_counter += 1
+    return f"{prefix}-{int(time.time() * 1000)}-{_id_counter}"

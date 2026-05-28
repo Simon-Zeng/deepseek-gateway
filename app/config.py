@@ -59,7 +59,7 @@ class GatewaySettings(BaseSettings):
 
     # Reasoning handling for OpenAI Chat
     reasoning_mode: str = "drop"  # drop | prepend | custom_field
-    reasoning_prepend_marker: str = "<think>\n</think>"
+    reasoning_prepend_marker: str = "<think>\n"
 
     # Model mapping config path
     model_mapping_path: str = str(PROJECT_ROOT / "config" / "model_mapping.yaml")

@@ -17,7 +17,7 @@ from app.services.deepseek_client import DeepSeekClient, get_client
 from app.services.model_mapper import ModelMapper, MappingResult
 from app.streamers.anthropic import stream_anthropic
 from app.utils.errors import create_anthropic_error
-from app.utils.sse import generate_id
+from app.utils.sse import generate_id, format_sse_event, format_sse_done
 
 logger = logging.getLogger(__name__)
 
@@ -111,16 +111,32 @@ async def _handle_streaming(
     """Handle a streaming Anthropic messages request."""
     deepseek_stream = client.chat_completion_stream(deepseek_request, api_key)
 
-    async def response_generator():
-        async for chunk_str in stream_anthropic(
-            deepseek_stream,
-            original_model=original_model,
-            model_type=mapping.model_type,
-        ):
-            yield chunk_str
+    async def safe_response_generator():
+        """Wrap stream to handle upstream errors gracefully."""
+        try:
+            async for chunk_str in stream_anthropic(
+                deepseek_stream,
+                original_model=original_model,
+                model_type=mapping.model_type,
+            ):
+                yield chunk_str
+        except Exception as e:
+            logger.error("Anthropic stream error: %s", e)
+            yield format_sse_event(
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": "Upstream stream failed"},
+                },
+                event="error",
+            )
+            yield format_sse_event(
+                {"type": "message_stop"},
+                event="message_stop",
+            )
+        yield format_sse_done()
 
     return StreamingResponse(
-        response_generator(),
+        safe_response_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

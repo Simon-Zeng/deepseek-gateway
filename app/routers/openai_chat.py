@@ -15,7 +15,7 @@ from app.models.common import ModelType
 from app.models.deepseek import DeepSeekRequest
 from app.models.openai_chat import ChatCompletionRequest, ChatCompletionResponse
 from app.services.deepseek_client import DeepSeekClient, get_client
-from app.services.model_mapper import ModelMapper, MappingResult
+from app.services.model_mapper import ModelMapper, MappingResult, map_reasoning_effort
 from app.streamers.openai_chat import stream_openai_chat
 from app.utils.errors import convert_deepseek_error, create_openai_error
 from app.utils.sse import generate_id, format_sse_event, format_sse_done
@@ -23,11 +23,6 @@ from app.utils.sse import generate_id, format_sse_event, format_sse_done
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-def get_mapper() -> ModelMapper:
-    """Get the model mapper instance from app state."""
-    return router.app.state.model_mapper
 
 
 @router.post("/v1/chat/completions")
@@ -64,11 +59,30 @@ async def chat_completions(
     except Exception as e:
         logger.error("Request conversion error: %s", e)
         error_resp, _ = create_openai_error(
-            message=f"Failed to convert request: {e}",
+            message="Failed to convert request",
             error_type="invalid_request_error",
             status_code=400,
         )
         return error_resp
+
+    # ── Forward reasoning_effort ONLY if target model supports thinking ──
+    # Setting thinking on a non-thinking model (e.g. deepseek-v4-flash) causes
+    # DeepSeek API to return 400 Bad Request.
+    if reasoning_effort:
+        if mapper.is_thinking_model(mapping.target_model):
+            ds_effort = map_reasoning_effort(reasoning_effort)
+            if ds_effort:
+                deepseek_request.reasoning_effort = ds_effort
+                deepseek_request.thinking = {"type": "enabled"}
+                logger.debug(
+                    "Forwarded reasoning_effort=%s -> %s to %s (thinking model)",
+                    reasoning_effort, ds_effort, mapping.target_model,
+                )
+        else:
+            logger.debug(
+                "Skipping reasoning_effort=%s: model %s does not support thinking",
+                reasoning_effort, mapping.target_model,
+            )
 
     # ── Call DeepSeek ──
     if request.stream:
@@ -90,7 +104,7 @@ async def _handle_non_streaming(
     except Exception as e:
         logger.error("DeepSeek API error: %s", e)
         error_resp, _ = create_openai_error(
-            message=f"DeepSeek API error: {e}",
+            message="Upstream API error",
             error_type="server_error",
             status_code=502,
             code="upstream_error",

@@ -155,7 +155,7 @@ async def stream_openai_responses(
 
             # Handle tool_calls
             tool_calls = delta.get("tool_calls")
-            if tool_calls is not None:
+            if tool_calls:
                 # Close any open content/reasoning before starting tool calls
                 if phase == StreamPhase.REASONING:
                     reasoning_out_idx = 0
@@ -354,7 +354,7 @@ async def stream_openai_responses(
             # Handle finish
             if finish_reason:
                 # Close any open items based on current phase
-                if (phase == StreamPhase.REASONING and accumulated_reasoning) or (phase == StreamPhase.TOOL_CALLS and accumulated_reasoning and not message_emitted):
+                if phase == StreamPhase.REASONING:
                     # Close reasoning (no content came)
                     reasoning_out_idx = 0
                     yield format_sse_event({
@@ -462,6 +462,7 @@ async def stream_openai_responses(
                     accumulated_content, message_id,
                     pending_tool_calls,
                     saved_message_id, saved_message_content,
+                    output_items,
                 )
 
                 # Determine status and incomplete_details from finish_reason
@@ -566,12 +567,22 @@ async def stream_openai_responses(
                     },
                 })
 
+        # Build complete output array including saved_message for accurate response
+        final_output = _build_output(
+            is_reasoner, accumulated_reasoning, reasoning_id,
+            accumulated_content, message_id,
+            pending_tool_calls,
+            saved_message_id, saved_message_content,
+            output_items,
+        )
+
         yield format_sse_event({
             "type": "response.failed",
             "response": {
                 "id": response_id,
                 "status": "failed",
                 "model": original_model,
+                "output": final_output,
             },
         })
 
@@ -592,7 +603,8 @@ def _get_message_output_index(output_items: list[dict]) -> int:
             last_idx = i
     if last_idx is not None:
         return last_idx
-    logger.warning("No message output item found in %d output items, using index 0", len(output_items))
+    # Should not be reached — all callers guard with message_emitted
+    logger.warning("No message item found, fallback index=0")
     return 0
 
 
@@ -605,8 +617,12 @@ def _build_output(
     pending_tool_calls: dict[int, dict],
     saved_message_id: str = "",
     saved_message_content: str = "",
+    output_items: list | None = None,
 ) -> list:
     """Build the output array for the completed response.
+
+    Uses output_items order to reconstruct the final output array in the
+    correct sequence (matching streaming event order, not type grouping).
 
     Args:
         is_reasoner: Whether the model is a reasoner.
@@ -619,7 +635,17 @@ def _build_output(
         pending_tool_calls: Dict of tool calls being accumulated.
         saved_message_id: ID of message that was closed by tool_calls handler.
         saved_message_content: Content of message closed by tool_calls handler.
+        output_items: Ordered list of emitted output item descriptors, used
+            to determine the correct sequence of items in the output array.
     """
+    if output_items:
+        return _build_output_from_items(
+            output_items, reasoning, reasoning_id,
+            content, message_id, pending_tool_calls,
+            saved_message_id, saved_message_content, is_reasoner,
+        )
+
+    # Fallback for callers without output_items
     output = []
     if is_reasoner and reasoning:
         output.append({
@@ -628,12 +654,6 @@ def _build_output(
             "summary": [{"type": "summary_text", "text": reasoning}],
         })
 
-    # Include message items in the order they were streamed.
-    # After tool_calls close the first message, saved_message_content stores
-    # its content. If new content arrives after tool_calls, a second message
-    # is started. Emit both in correct order.
-    # For reasoning-only responses, include an empty message to match
-    # convert_response() behavior.
     if saved_message_content:
         output.append({
             "type": "message",
@@ -651,7 +671,6 @@ def _build_output(
             "content": [{"type": "output_text", "text": content, "annotations": []}],
         })
     if not content and not saved_message_content and is_reasoner and reasoning:
-        # Reasoning-only: include an empty message item
         output.append({
             "type": "message",
             "id": message_id,
@@ -659,7 +678,6 @@ def _build_output(
             "status": "completed",
             "content": [{"type": "output_text", "text": "", "annotations": []}],
         })
-    # Add function_call items
     for tc_index, tc in sorted(pending_tool_calls.items()):
         if tc.get("started"):
             output.append({
@@ -669,4 +687,81 @@ def _build_output(
                 "name": tc["name"],
                 "arguments": tc["arguments"],
             })
+    return output
+
+
+def _build_output_from_items(
+    output_items: list[dict],
+    reasoning: str,
+    reasoning_id: str,
+    content: str,
+    message_id: str,
+    pending_tool_calls: dict[int, dict],
+    saved_message_id: str,
+    saved_message_content: str,
+    is_reasoner: bool,
+) -> list:
+    """Build output array ordered by output_items emission sequence."""
+    output = []
+
+    # Build lookup: tool call index -> tool call data
+    tc_by_item_id: dict[str, dict] = {}
+    for tc_index, tc in sorted(pending_tool_calls.items()):
+        if tc.get("started"):
+            item_id = tc.get("id", "")
+            if item_id:
+                tc_by_item_id[item_id] = tc
+
+    for item in output_items:
+        item_type = item.get("type")
+
+        if item_type == "reasoning" and is_reasoner and reasoning:
+            output.append({
+                "type": "reasoning",
+                "id": reasoning_id,
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            })
+
+        elif item_type == "message":
+            item_id = item.get("id", "")
+
+            # Match against saved_message or current message
+            if saved_message_content and item_id == saved_message_id:
+                output.append({
+                    "type": "message",
+                    "id": saved_message_id,
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": saved_message_content, "annotations": []}],
+                })
+            elif item_id == message_id and content:
+                output.append({
+                    "type": "message",
+                    "id": message_id,
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": content, "annotations": []}],
+                })
+            elif item_id == message_id and not content and is_reasoner and reasoning:
+                # Reasoning-only: empty message
+                output.append({
+                    "type": "message",
+                    "id": message_id,
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "", "annotations": []}],
+                })
+
+        elif item_type == "function_call":
+            item_id = item.get("id", "")
+            tc = tc_by_item_id.get(item_id)
+            if tc:
+                output.append({
+                    "type": "function_call",
+                    "id": tc["id"],
+                    "call_id": tc["call_id"],
+                    "name": tc["name"],
+                    "arguments": tc["arguments"],
+                })
+
     return output

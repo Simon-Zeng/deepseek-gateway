@@ -29,19 +29,16 @@ async def list_models(req: Request, api_key: str = Depends(verify_api_key)):
         return result
     except Exception as e:
         logger.error("Failed to fetch models from DeepSeek: %s", e)
-        from fastapi.responses import JSONResponse
-        return JSONResponse(
+        error_resp, _ = create_openai_error(
+            message="Failed to fetch models from upstream",
+            error_type="upstream_error",
             status_code=502,
-            content=create_openai_error(
-                message=f"Failed to fetch models from upstream: {e}",
-                error_type="upstream_error",
-                status_code=502,
-            ),
         )
+        return error_resp
 
 
 @router.get("/v1/models/{model_id}")
-async def get_model(model_id: str, req: Request):
+async def get_model(model_id: str, req: Request, api_key: str = Depends(verify_api_key)):
     """Get details about a specific model."""
     mapper: ModelMapper = req.app.state.model_mapper
     mapping = mapper.map_model(model_id)

@@ -29,7 +29,6 @@ from app.models.openai_chat import (
     ChatCompletionResponse,
     ChatCompletionUsage,
 )
-from app.services.model_mapper import map_reasoning_effort
 from app.utils.sse import generate_id
 
 logger = logging.getLogger(__name__)
@@ -137,29 +136,33 @@ def convert_request(
         messages.append(ds_msg)
 
     # Map max_completion_tokens -> max_tokens
-    max_tokens = request.max_tokens or request.max_completion_tokens
+    max_tokens = request.max_tokens if request.max_tokens is not None else request.max_completion_tokens
 
     # Build stop sequences
     stop = request.stop
     if stop is not None and isinstance(stop, list) and len(stop) == 0:
         stop = None
 
-    # Build DeepSeek request — pass tools through (DeepSeek supports function calling)
-    # Only pass tool_choice when tools are present to avoid API errors
+    # Build DeepSeek request
     tool_choice = request.tool_choice if request.tools else None
-
-    # ── Forward reasoning_effort to DeepSeek ──
-    # DeepSeek V4 supports reasoning_effort and thinking as top-level request
-    # parameters. We extract it from the incoming request and map the value.
-    reasoning_effort = getattr(request, "reasoning_effort", None)
-    if reasoning_effort is None and hasattr(request, "model_extra") and request.model_extra:
-        reasoning_effort = request.model_extra.get("reasoning_effort")
-    if reasoning_effort:
-        ds_effort = map_reasoning_effort(reasoning_effort)
-        if ds_effort:
-            deepseek_req.reasoning_effort = ds_effort
-            deepseek_req.thinking = {"type": "enabled"}
-            logger.debug("Forwarded reasoning_effort=%s -> %s to DeepSeek", reasoning_effort, ds_effort)
+    deepseek_req = DeepSeekRequest(
+        model=target_model,
+        messages=messages,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_tokens=max_tokens,
+        stream=request.stream,
+        stop=stop,
+        frequency_penalty=request.frequency_penalty,
+        presence_penalty=request.presence_penalty,
+        n=request.n,
+        tools=request.tools,
+        tool_choice=tool_choice,
+        response_format=request.response_format,
+        logprobs=request.logprobs,
+        top_logprobs=request.top_logprobs,
+        seed=request.seed,
+    )
 
     # Log any unrecognized extra fields that would be silently dropped.
     # Note: stream_options, user, logit_bias, and reasoning_effort are
@@ -246,11 +249,14 @@ def _convert_content(
     if reasoning_mode == "prepend":
         settings = get_settings()
         marker = settings.gateway.reasoning_prepend_marker
+        suffix = "\n</think>\n"
+        if content and reasoning:
+            return f"{marker}{reasoning}{suffix}{content}"
+        if reasoning:
+            return f"{marker}{reasoning}\n</think>\n"
         if content:
             return f"{marker}{content}"
-        if reasoning:
-            return f"{marker}{reasoning}"
-        return marker
+        return content
 
     # Default: "drop" - just return content without reasoning
     return content

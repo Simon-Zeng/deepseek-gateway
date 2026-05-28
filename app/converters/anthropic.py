@@ -198,7 +198,7 @@ def convert_response(
         if message.tool_calls:
             for tc in message.tool_calls:
                 tc_id = to_toolu(tc.get("id", ""))
-                tc_function = tc.get("function", {})
+                tc_function = tc.get("function") or {}
                 tc_name = tc_function.get("name", "")
                 tc_input = tc_function.get("arguments", {})
                 # Parse arguments if it's a string
@@ -278,6 +278,9 @@ def _extract_tool_calls_and_text(content) -> tuple[Optional[list[dict]], Optiona
                 text_parts.append(block.get("text", ""))
             elif block_type == "thinking":
                 # Skip thinking blocks from previous messages
+                pass
+            elif block_type == "signature":
+                # Skip signature blocks (extended thinking verification)
                 pass
             elif block_type in ("image",):
                 logger.debug("Discarding image content block (DeepSeek is text-only)")
@@ -426,6 +429,8 @@ def _convert_tool_choice(tool_choice) -> Optional[dict | str]:
                 "type": "function",
                 "function": {"name": tool_choice.get("name", "")},
             }
+        elif tc_type == "none":
+            return "none"
 
     return "auto"
 
@@ -465,6 +470,9 @@ def _extract_text_content(content) -> Optional[str]:
                 elif block_type == "thinking":
                     # Skip thinking blocks from previous messages
                     pass
+                elif block_type == "signature":
+                    # Skip signature blocks (extended thinking verification)
+                    pass
                 elif block_type in ("image",):
                     logger.debug("Discarding image content block (DeepSeek is text-only)")
                 elif "text" in block:
@@ -494,5 +502,6 @@ def _map_finish_reason(finish_reason: Optional[str]) -> Optional[str]:
         "length": "max_tokens",
         "tool_calls": "tool_use",
         "content_filter": "end_turn",
+        "error": "end_turn",
     }
     return mapping.get(finish_reason, finish_reason)

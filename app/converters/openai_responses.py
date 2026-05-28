@@ -21,7 +21,6 @@ from app.models.openai_responses import (
     ResponsesUsage,
     SummaryText,
 )
-from app.services.model_mapper import map_reasoning_effort
 from app.utils.sse import generate_id
 from app.utils.tool_call_ids import to_call
 
@@ -292,17 +291,6 @@ def convert_request(
         tool_choice=converted_tool_choice if converted_tools else None,
         response_format=response_format,
     )
-
-    # ── Forward reasoning.effort to DeepSeek ──
-    if request.reasoning and request.reasoning.effort:
-        ds_effort = map_reasoning_effort(request.reasoning.effort)
-        if ds_effort:
-            deepseek_req.reasoning_effort = ds_effort
-            deepseek_req.thinking = {"type": "enabled"}
-            logger.debug(
-                "Forwarded reasoning.effort=%s -> %s to DeepSeek",
-                request.reasoning.effort, ds_effort,
-            )
 
     return deepseek_req
 

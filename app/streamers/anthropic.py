@@ -176,6 +176,12 @@ async def stream_anthropic(
             event="error",
         )
 
+        # Emit message_stop to signal stream end to the client
+        yield format_sse_event(
+            {"type": "message_stop"},
+            event="message_stop",
+        )
+
 
 async def _handle_reasoning(state: AnthropicStreamState, reasoning_text: str) -> AsyncIterator[str]:
     """Handle a reasoning_content chunk."""
