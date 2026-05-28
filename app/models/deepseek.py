@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 # ── Request Models ──
@@ -17,6 +17,10 @@ class DeepSeekMessage(BaseModel):
     - system, user, assistant: content is string
     - assistant with tool_calls: tool_calls list + optional content
     - tool (result): tool_call_id + content (string)
+
+    When using thinking mode, DeepSeek requires that ``reasoning_content``
+    from a previous assistant response be passed back verbatim in multi-turn
+    conversations. It is included in the serialized payload only when set.
     """
 
     role: str
@@ -24,7 +28,7 @@ class DeepSeekMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[list[dict]] = None
     tool_call_id: Optional[str] = None
-    reasoning_content: Optional[str] = Field(None, exclude=True)  # Strip from outgoing
+    reasoning_content: Optional[str] = None  # Pass back to DeepSeek in thinking mode
 
     model_config = {"extra": "allow"}
 

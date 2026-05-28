@@ -86,19 +86,29 @@ def _get_item_attr(item, key, default=None):
     return getattr(item, key, default)
 
 
-def _convert_input_item(item, messages: list):
+def _convert_input_item(item, messages: list, last_reasoning: list[str] | None = None):
     """Convert a single input item (dict or Pydantic model) to DeepSeekMessage(s).
 
     Handles these Responses API input item types:
     - "message": standard user/assistant/system message
     - "function_call": assistant tool call → DeepSeek tool_calls format
     - "function_call_output": tool result → DeepSeek tool role message
+    - "reasoning": captures text for inclusion in the next assistant message
+      (DeepSeek thinking mode requires ``reasoning_content`` to be passed
+      back verbatim in multi-turn conversations)
 
     Works with both raw dicts and Pydantic ``ResponseInputMessage`` models.
     When Pydantic parses the ``input`` list, items with ``type: "function_call"``
     or ``type: "function_call_output"`` are still coerced into
     ``ResponseInputMessage`` models (extra fields preserved via ``extra="allow"``).
     We use ``_get_item_attr()`` to abstract dict vs model access.
+
+    Args:
+        item: A dict or Pydantic model from the Responses API input list.
+        messages: Output list of DeepSeekMessage (mutated in place).
+        last_reasoning: Optional mutable container for tracking reasoning text
+            between items. ``last_reasoning[0]`` is consumed and cleared when
+            a ``function_call`` item creates an assistant message.
     """
     item_type = _get_item_attr(item, "type")
 
@@ -117,7 +127,7 @@ def _convert_input_item(item, messages: list):
         if isinstance(arguments, dict):
             arguments = json.dumps(arguments, ensure_ascii=False)
 
-        messages.append(DeepSeekMessage(
+        ds_msg = DeepSeekMessage(
             role="assistant",
             content=None,
             tool_calls=[{
@@ -128,7 +138,15 @@ def _convert_input_item(item, messages: list):
                     "arguments": arguments,
                 },
             }],
-        ))
+        )
+
+        # In thinking mode, DeepSeek requires reasoning_content to be passed
+        # back verbatim in multi-turn conversations.
+        if last_reasoning is not None and last_reasoning[0]:
+            ds_msg.reasoning_content = last_reasoning[0]
+            last_reasoning[0] = ""
+
+        messages.append(ds_msg)
         return
 
     # ── function_call_output: tool result ──
@@ -148,9 +166,17 @@ def _convert_input_item(item, messages: list):
         ))
         return
 
-    # ── reasoning: skip (DeepSeek doesn't accept reasoning in input) ──
+    # ── reasoning: capture text for inclusion in next assistant message ──
+    # DeepSeek thinking mode requires reasoning_content to be passed back
+    # verbatim in multi-turn conversations. We capture it here and attach
+    # it when the next function_call (assistant) item is processed.
     if item_type == "reasoning":
-        logger.debug("Skipping reasoning input item (not supported by DeepSeek)")
+        if last_reasoning is not None:
+            summary = _get_item_attr(item, "summary", [])
+            if summary and isinstance(summary, list):
+                text = summary[0].get("text", "") if isinstance(summary[0], dict) else ""
+                if text:
+                    last_reasoning[0] = text
         return
 
     # ── Regular message type ──
@@ -211,8 +237,9 @@ def convert_request(
             content=request.input,
         ))
     elif isinstance(request.input, list):
+        last_reasoning = [""]  # Mutable container to track reasoning text across items
         for item in request.input:
-            _convert_input_item(item, messages)
+            _convert_input_item(item, messages, last_reasoning)
 
     # Log warnings for unsupported features
     if request.previous_response_id:
