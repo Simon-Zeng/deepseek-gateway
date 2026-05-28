@@ -86,6 +86,33 @@ def _get_item_attr(item, key, default=None):
     return getattr(item, key, default)
 
 
+def _merge_tool_calls_into_last_assistant(
+    messages: list,
+    tool_calls: list[dict],
+    reasoning_content: str | None = None,
+) -> None:
+    """Merge tool_calls into the last assistant message if it has no tool_calls yet.
+
+    In the Responses API, an assistant's content and function_call items are
+    separate input items. DeepSeek expects them in a SINGLE assistant message.
+    This helper merges consecutive assistant content + tool_calls into one
+    message to preserve the correct conversation structure.
+    """
+    if messages and messages[-1].role == "assistant" and not messages[-1].tool_calls:
+        messages[-1].tool_calls = tool_calls
+        if reasoning_content:
+            messages[-1].reasoning_content = reasoning_content
+    else:
+        ds_msg = DeepSeekMessage(
+            role="assistant",
+            content=None,
+            tool_calls=tool_calls,
+        )
+        if reasoning_content:
+            ds_msg.reasoning_content = reasoning_content
+        messages.append(ds_msg)
+
+
 def _convert_input_item(item, messages: list, last_reasoning: list[str] | None = None):
     """Convert a single input item (dict or Pydantic model) to DeepSeekMessage(s).
 
@@ -108,7 +135,7 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
         messages: Output list of DeepSeekMessage (mutated in place).
         last_reasoning: Optional mutable container for tracking reasoning text
             between items. ``last_reasoning[0]`` is consumed and cleared when
-            a ``function_call`` item creates an assistant message.
+            an assistant message (regular or function_call) is created.
     """
     item_type = _get_item_attr(item, "type")
 
@@ -127,10 +154,13 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
         if isinstance(arguments, dict):
             arguments = json.dumps(arguments, ensure_ascii=False)
 
-        ds_msg = DeepSeekMessage(
-            role="assistant",
-            content=None,
-            tool_calls=[{
+        reasoning = last_reasoning[0] if last_reasoning else None
+        if reasoning:
+            last_reasoning[0] = ""
+
+        _merge_tool_calls_into_last_assistant(
+            messages,
+            [{
                 "id": to_call(call_id),
                 "type": "function",
                 "function": {
@@ -138,15 +168,8 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
                     "arguments": arguments,
                 },
             }],
+            reasoning_content=reasoning,
         )
-
-        # In thinking mode, DeepSeek requires reasoning_content to be passed
-        # back verbatim in multi-turn conversations.
-        if last_reasoning is not None and last_reasoning[0]:
-            ds_msg.reasoning_content = last_reasoning[0]
-            last_reasoning[0] = ""
-
-        messages.append(ds_msg)
         return
 
     # ── function_call_output: tool result ──
@@ -169,12 +192,12 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
     # ── reasoning: capture text for inclusion in next assistant message ──
     # DeepSeek thinking mode requires reasoning_content to be passed back
     # verbatim in multi-turn conversations. We capture it here and attach
-    # it when the next function_call (assistant) item is processed.
+    # it when the next assistant message is processed.
     if item_type == "reasoning":
         if last_reasoning is not None:
             summary = _get_item_attr(item, "summary", [])
             if summary and isinstance(summary, list):
-                text = summary[0].get("text", "") if isinstance(summary[0], dict) else ""
+                text = _get_item_attr(summary[0], "text", "")
                 if text:
                     last_reasoning[0] = text
         return
@@ -203,6 +226,11 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
         msg.tool_call_id = tool_call_id
     if name:
         msg.name = name
+
+    # Attach reasoning text for assistant messages (consumed here if available)
+    if role == "assistant" and last_reasoning is not None and last_reasoning[0]:
+        msg.reasoning_content = last_reasoning[0]
+        last_reasoning[0] = ""
 
     messages.append(msg)
 
@@ -269,15 +297,12 @@ def convert_request(
 
             # ── Flush any pending tool_calls as a single assistant message ──
             if pending_tool_calls:
-                ds_msg = DeepSeekMessage(
-                    role="assistant",
-                    content=None,
-                    tool_calls=pending_tool_calls,
-                )
-                if last_reasoning and last_reasoning[0]:
-                    ds_msg.reasoning_content = last_reasoning[0]
+                reasoning = last_reasoning[0] if last_reasoning and last_reasoning[0] else None
+                if reasoning:
                     last_reasoning[0] = ""
-                messages.append(ds_msg)
+                _merge_tool_calls_into_last_assistant(
+                    messages, pending_tool_calls, reasoning_content=reasoning
+                )
                 pending_tool_calls = []
 
             # Process the current non-function_call item normally
@@ -285,15 +310,12 @@ def convert_request(
 
         # ── Flush any remaining tool_calls at end of input ──
         if pending_tool_calls:
-            ds_msg = DeepSeekMessage(
-                role="assistant",
-                content=None,
-                tool_calls=pending_tool_calls,
-            )
-            if last_reasoning and last_reasoning[0]:
-                ds_msg.reasoning_content = last_reasoning[0]
+            reasoning = last_reasoning[0] if last_reasoning and last_reasoning[0] else None
+            if reasoning:
                 last_reasoning[0] = ""
-            messages.append(ds_msg)
+            _merge_tool_calls_into_last_assistant(
+                messages, pending_tool_calls, reasoning_content=reasoning
+            )
 
     # Log warnings for unsupported features
     if request.previous_response_id:

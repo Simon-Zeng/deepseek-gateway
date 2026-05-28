@@ -75,15 +75,12 @@ def convert_request(
 
         if tool_calls:
             # Assistant message with tool calls → DeepSeek format
-            # DeepSeek expects tool_calls messages to have content: null.
-            # If text_content is non-empty, log it so the info isn't lost
-            # but don't include it (some Anthropic clients send text alongside
-            # tool_use blocks, which DeepSeek does not accept).
-            if text_content:
-                logger.debug("Discarding text content from tool_calls message (DeepSeek requires content=null)")
+            # DeepSeek supports BOTH content and tool_calls in one message.
+            # Anthropic messages can have text blocks alongside tool_use blocks —
+            # preserve the text content instead of discarding it.
             ds_msg = DeepSeekMessage(
                 role=role,
-                content=None,
+                content=text_content or "",
                 tool_calls=tool_calls,
             )
             # In thinking mode, DeepSeek requires reasoning_content to be passed
@@ -96,12 +93,17 @@ def convert_request(
             for tc_msg in _convert_tool_results(msg.content):
                 messages.append(tc_msg)
         else:
-            # Regular message — flatten content to string
+            # Regular message — flatten content to string.
+            # In thinking mode, DeepSeek requires reasoning_content to be
+            # passed back verbatim on assistant messages in multi-turn.
             content = _extract_text_content(msg.content)
-            messages.append(DeepSeekMessage(
+            ds_msg = DeepSeekMessage(
                 role=role,
                 content=content,
-            ))
+            )
+            if reasoning and role == "assistant":
+                ds_msg.reasoning_content = reasoning
+            messages.append(ds_msg)
 
     # Map Anthropic-specific fields to DeepSeek equivalents
     # Convert Anthropic tool definitions to OpenAI format if present
@@ -220,6 +222,10 @@ def convert_response(
                     "input": tc_input,
                 })
 
+    # Ensure at least one content block (Anthropic requires non-empty content)
+    if not content_blocks:
+        content_blocks.append(TextResponseBlock(text=""))
+
     # Map finish_reason
     stop_reason = None
     if deepseek_response.choices:
@@ -255,7 +261,7 @@ def _extract_tool_calls_and_text(content) -> tuple[Optional[list[dict]], Optiona
 
     In thinking mode, DeepSeek requires ``reasoning_content`` to be passed
     back verbatim in multi-turn conversations. We extract it from the
-    ``thinking`` blocks and return it as the third element.
+    ``thinking`` blocks (joined with newlines if multiple) and return it as the third element.
 
     Returns:
         Tuple of (tool_calls list or None, text content or None, reasoning text or None)
