@@ -110,6 +110,12 @@ class DeepSeekClient:
         # For streaming, we need to read the response as it comes
         headers["Accept"] = "text/event-stream"
 
+        # Log the full outgoing payload at DEBUG level
+        logger.debug(
+            "Sending streaming request to DeepSeek: payload=%s",
+            json.dumps(payload, ensure_ascii=False),
+        )
+
         response = await self._request_with_retry(
             "POST",
             "/chat/completions",
@@ -206,10 +212,15 @@ class DeepSeekClient:
                                     "DeepSeek %d request failed. Request body: %s",
                                     response.status_code, body_str,
                                 )
-                            resp_body = response.text[:4000] if response.text else "(empty)"
-                            logger.error("DeepSeek %d response body: %s", response.status_code, resp_body)
-                        except Exception:
-                            pass
+                            # For streaming responses, read the body explicitly
+                            if stream:
+                                resp_body_bytes = await response.aread()
+                                resp_body_text = resp_body_bytes.decode("utf-8", errors="replace")[:4000]
+                            else:
+                                resp_body_text = response.text[:4000] if response.text else "(empty)"
+                            logger.error("DeepSeek %d response body: %s", response.status_code, resp_body_text)
+                        except Exception as e:
+                            logger.error("Failed to log DeepSeek error details: %s", e)
                         response.raise_for_status()
 
                     # Server error - retry

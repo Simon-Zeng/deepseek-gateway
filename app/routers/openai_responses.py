@@ -128,6 +128,18 @@ async def _handle_streaming(
     mapping: MappingResult,
 ) -> StreamingResponse:
     """Handle a streaming responses request."""
+    # Log the payload being sent to DeepSeek for debugging
+    payload_preview = deepseek_request.model_dump(exclude_none=True, mode="json")
+    logger.info(
+        "Sending to DeepSeek: model=%s tools=%d tool_choice=%s thinking=%s effort=%s msg_count=%d",
+        payload_preview.get("model"),
+        len(payload_preview.get("tools", [])),
+        payload_preview.get("tool_choice"),
+        payload_preview.get("thinking"),
+        payload_preview.get("reasoning_effort"),
+        len(payload_preview.get("messages", [])),
+    )
+
     deepseek_stream = client.chat_completion_stream(deepseek_request, api_key)
 
     response_id = generate_id("resp")
