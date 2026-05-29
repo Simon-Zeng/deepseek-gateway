@@ -603,6 +603,11 @@ async def stream_openai_responses(
                     },
                 })
 
+        # Save any unclosed reasoning before building final output
+        if accumulated_reasoning:
+            saved_reasonings.append(accumulated_reasoning)
+            accumulated_reasoning = ""
+
         # Build complete output array including saved_message for accurate response
         final_output = _build_output(
             is_reasoner, accumulated_reasoning, reasoning_id,

@@ -222,10 +222,10 @@ def convert_response(
                     "input": tc_input,
                 })
 
-    # DeepSeek returned no content — fall back to an empty text block.
-    logger.warning("DeepSeek returned empty response with no content, reasoning, or tool calls")
-    # Ensure at least one content block (Anthropic requires non-empty content)
     if not content_blocks:
+        # DeepSeek returned no content — fall back to an empty text block
+        # (Anthropic requires non-empty content).
+        logger.warning("DeepSeek returned empty response with no content, reasoning, or tool calls")
         content_blocks.append(TextResponseBlock(text=""))
 
     # Map finish_reason
