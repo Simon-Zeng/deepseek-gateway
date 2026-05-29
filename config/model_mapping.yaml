@@ -38,6 +38,10 @@ mapping:
   - pattern: "^claude-opus-4-latest$"
     target: deepseek-v4-pro
     type: reasoner
+  # Opus short variant (e.g., claude-opus-4-7, claude-opus-4-5)
+  - pattern: "^claude-opus-4-\\d+$"
+    target: deepseek-v4-pro
+    type: reasoner
 
   # Other Claude models -> deepseek-v4-flash
   - pattern: "^claude-3[.-]5-sonnet(-\\d{8})?$"

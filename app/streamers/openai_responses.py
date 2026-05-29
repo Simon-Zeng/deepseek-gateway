@@ -38,8 +38,12 @@ async def stream_openai_responses(
     - response.created
     - response.in_progress
     - response.output_item.added
+    - response.reasoning_summary_part.added
+    - response.reasoning_summary_text.delta
+    - response.reasoning_summary_text.done
+    - response.reasoning_summary_part.done
     - response.content_part.added
-    - response.output_text.delta (or response.reasoning.delta)
+    - response.output_text.delta (or response.reasoning_summary_text.delta)
     - response.output_text.done
     - response.content_part.done
     - response.output_item.done
@@ -73,11 +77,14 @@ async def stream_openai_responses(
     output_items: list[dict] = []  # track emitted output items
     message_emitted = False  # whether the message output item has been emitted
 
-    # Saved state from message that was closed by tool_calls handler.
+    # Saved state from message / reasoning that was closed by tool_calls handler.
     # Used by _build_output to reconstruct the final output for
-    # response.completed when message was already closed during streaming.
+    # response.completed when message/reasoning was already closed during streaming.
     saved_message_id = ""
     saved_message_content = ""
+    # Accumulate ALL reasoning blocks (multiple tool-call rounds each close
+    # reasoning — we append not overwrite so the first block isn't lost).
+    saved_reasonings: list[str] = []
 
     # Tool call tracking: index -> {id, name, arguments, call_id}
     pending_tool_calls: dict[int, dict] = {}
@@ -111,8 +118,14 @@ async def stream_openai_responses(
         },
     })
 
+    stream_started = False
     async for chunk in deepseek_stream:
+        if not stream_started:
+            stream_started = True
+            logger.info("Stream processing started, first chunk keys: %s", list(chunk.keys()))
+
         if not chunk.get("choices"):
+            logger.info("Stream chunk with no choices: keys=%s", list(chunk.keys()))
             continue
 
         for choice in chunk["choices"]:
@@ -143,7 +156,7 @@ async def stream_openai_responses(
                     })
                     output_items.append({"type": "reasoning", "id": reasoning_id})
                     yield format_sse_event({
-                        "type": "response.content_part.added",
+                        "type": "response.reasoning_summary_part.added",
                         "part": {"type": "summary_text", "text": ""},
                         "output_index": out_idx,
                         "content_index": 0,
@@ -153,7 +166,7 @@ async def stream_openai_responses(
                 # Find reasoning output index
                 reasoning_out_idx = 0  # reasoning is always first if present
                 yield format_sse_event({
-                    "type": "response.reasoning.delta",
+                    "type": "response.reasoning_summary_text.delta",
                     "output_index": reasoning_out_idx,
                     "content_index": 0,
                     "delta": reasoning_text,
@@ -166,13 +179,13 @@ async def stream_openai_responses(
                 if phase == StreamPhase.REASONING:
                     reasoning_out_idx = 0
                     yield format_sse_event({
-                        "type": "response.reasoning.done",
+                        "type": "response.reasoning_summary_text.done",
                         "output_index": reasoning_out_idx,
                         "content_index": 0,
                         "text": accumulated_reasoning,
                     })
                     yield format_sse_event({
-                        "type": "response.content_part.done",
+                        "type": "response.reasoning_summary_part.done",
                         "part": {"type": "summary_text", "text": accumulated_reasoning},
                         "output_index": reasoning_out_idx,
                         "content_index": 0,
@@ -186,7 +199,8 @@ async def stream_openai_responses(
                             "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
                         },
                     })
-                    accumulated_reasoning = ""  # Prevent re-close in finish handler
+                    saved_reasonings.append(accumulated_reasoning)
+                    accumulated_reasoning = ""
 
                 if message_emitted and phase in (StreamPhase.CONTENT, StreamPhase.REASONING):
                     # Close the message output item before tool calls
@@ -300,13 +314,13 @@ async def stream_openai_responses(
                     # Close reasoning
                     reasoning_out_idx = 0
                     yield format_sse_event({
-                        "type": "response.reasoning.done",
+                        "type": "response.reasoning_summary_text.done",
                         "output_index": reasoning_out_idx,
                         "content_index": 0,
                         "text": accumulated_reasoning,
                     })
                     yield format_sse_event({
-                        "type": "response.content_part.done",
+                        "type": "response.reasoning_summary_part.done",
                         "part": {"type": "summary_text", "text": accumulated_reasoning},
                         "output_index": reasoning_out_idx,
                         "content_index": 0,
@@ -320,7 +334,8 @@ async def stream_openai_responses(
                             "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
                         },
                     })
-                    accumulated_reasoning = ""  # Prevent re-close in finish handler
+                    saved_reasonings.append(accumulated_reasoning)
+                    accumulated_reasoning = ""
 
                     phase = StreamPhase.CONTENT
 
@@ -376,13 +391,13 @@ async def stream_openai_responses(
                     # Close reasoning (no content came)
                     reasoning_out_idx = 0
                     yield format_sse_event({
-                        "type": "response.reasoning.done",
+                        "type": "response.reasoning_summary_text.done",
                         "output_index": reasoning_out_idx,
                         "content_index": 0,
                         "text": accumulated_reasoning,
                     })
                     yield format_sse_event({
-                        "type": "response.content_part.done",
+                        "type": "response.reasoning_summary_part.done",
                         "part": {"type": "summary_text", "text": accumulated_reasoning},
                         "output_index": reasoning_out_idx,
                         "content_index": 0,
@@ -396,6 +411,8 @@ async def stream_openai_responses(
                             "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
                         },
                     })
+                    saved_reasonings.append(accumulated_reasoning)
+                    accumulated_reasoning = ""
 
                 # If reasoning was present but no message was ever opened,
                 # emit an empty message to match convert_response() behavior
@@ -480,6 +497,7 @@ async def stream_openai_responses(
                     accumulated_content, message_id,
                     pending_tool_calls,
                     saved_message_id, saved_message_content,
+                    "\n".join(saved_reasonings) if saved_reasonings else "",
                     output_items,
                 )
 
@@ -517,13 +535,13 @@ async def stream_openai_responses(
         # Close reasoning if open (reasoning started but never closed)
         if accumulated_reasoning:
             yield format_sse_event({
-                "type": "response.reasoning.done",
+                "type": "response.reasoning_summary_text.done",
                 "output_index": 0,
                 "content_index": 0,
                 "text": accumulated_reasoning,
             })
             yield format_sse_event({
-                "type": "response.content_part.done",
+                "type": "response.reasoning_summary_part.done",
                 "part": {"type": "summary_text", "text": accumulated_reasoning},
                 "output_index": 0,
                 "content_index": 0,
@@ -591,6 +609,7 @@ async def stream_openai_responses(
             accumulated_content, message_id,
             pending_tool_calls,
             saved_message_id, saved_message_content,
+            "\n".join(saved_reasonings) if saved_reasonings else "",
             output_items,
         )
 
@@ -635,6 +654,7 @@ def _build_output(
     pending_tool_calls: dict[int, dict],
     saved_message_id: str = "",
     saved_message_content: str = "",
+    saved_reasoning: str = "",
     output_items: list | None = None,
 ) -> list:
     """Build the output array for the completed response.
@@ -660,7 +680,8 @@ def _build_output(
         return _build_output_from_items(
             output_items, reasoning, reasoning_id,
             content, message_id, pending_tool_calls,
-            saved_message_id, saved_message_content, is_reasoner,
+            saved_message_id, saved_message_content,
+            saved_reasoning, is_reasoner,
         )
 
     # Fallback for callers without output_items
@@ -717,6 +738,7 @@ def _build_output_from_items(
     pending_tool_calls: dict[int, dict],
     saved_message_id: str,
     saved_message_content: str,
+    saved_reasoning: str,
     is_reasoner: bool,
 ) -> list:
     """Build output array ordered by output_items emission sequence."""
@@ -733,11 +755,14 @@ def _build_output_from_items(
     for item in output_items:
         item_type = item.get("type")
 
-        if item_type == "reasoning" and is_reasoner and reasoning:
+        # Use saved_reasoning as fallback when reasoning was already closed
+        # by tool_calls handler (accumulated_reasoning was reset to "").
+        effective_reasoning = reasoning or saved_reasoning
+        if item_type == "reasoning" and is_reasoner and effective_reasoning:
             output.append({
                 "type": "reasoning",
                 "id": reasoning_id,
-                "summary": [{"type": "summary_text", "text": reasoning}],
+                "summary": [{"type": "summary_text", "text": effective_reasoning}],
             })
 
         elif item_type == "message":

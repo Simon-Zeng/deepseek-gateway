@@ -86,7 +86,7 @@ def _get_item_attr(item, key, default=None):
     return getattr(item, key, default)
 
 
-def _merge_tool_calls_into_last_assistant(
+def _add_or_merge_assistant_tool_calls(
     messages: list,
     tool_calls: list[dict],
     reasoning_content: str | None = None,
@@ -100,7 +100,7 @@ def _merge_tool_calls_into_last_assistant(
     """
     if messages and messages[-1].role == "assistant" and not messages[-1].tool_calls:
         messages[-1].tool_calls = tool_calls
-        if reasoning_content:
+        if reasoning_content and not getattr(messages[-1], "reasoning_content", None):
             messages[-1].reasoning_content = reasoning_content
     else:
         ds_msg = DeepSeekMessage(
@@ -155,10 +155,9 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
             arguments = json.dumps(arguments, ensure_ascii=False)
 
         reasoning = last_reasoning[0] if last_reasoning else None
-        if reasoning:
-            last_reasoning[0] = ""
+        # Do NOT clear — reasoning persists across the turn (see reasoning handler)
 
-        _merge_tool_calls_into_last_assistant(
+        _add_or_merge_assistant_tool_calls(
             messages,
             [{
                 "id": to_call(call_id),
@@ -189,10 +188,13 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
         ))
         return
 
-    # ── reasoning: capture text for inclusion in next assistant message ──
+    # ── reasoning: capture text — shared across ALL assistant items in a turn ──
     # DeepSeek thinking mode requires reasoning_content to be passed back
-    # verbatim in multi-turn conversations. We capture it here and attach
-    # it when the next assistant message is processed.
+    # verbatim in multi-turn conversations. A single reasoning item applies
+    # to the entire assistant turn (both content messages AND function_calls).
+    # We do NOT clear last_reasoning here — it persists until:
+    #   1. A new reasoning item arrives (overwritten)
+    #   2. A user/developer message arrives (cleared — new turn)
     if item_type == "reasoning":
         if last_reasoning is not None:
             summary = _get_item_attr(item, "summary", [])
@@ -200,6 +202,11 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
                 text = _get_item_attr(summary[0], "text", "")
                 if text:
                     last_reasoning[0] = text
+                    logger.debug("Captured reasoning text (%dc)", len(text))
+                else:
+                    logger.debug("Reasoning item with empty summary text")
+            else:
+                logger.debug("Reasoning item with empty/missing summary")
         return
 
     # ── Regular message type ──
@@ -227,12 +234,18 @@ def _convert_input_item(item, messages: list, last_reasoning: list[str] | None =
     if name:
         msg.name = name
 
-    # Attach reasoning text for assistant messages (consumed here if available)
+    # Attach reasoning text for assistant messages (do NOT clear — reasoning
+    # persists across all assistant items in the same turn: content message +
+    # function_calls).  Only cleared when a new reasoning item arrives or a
+    # user/developer message starts a new turn.
     if role == "assistant" and last_reasoning is not None and last_reasoning[0]:
         msg.reasoning_content = last_reasoning[0]
-        last_reasoning[0] = ""
 
     messages.append(msg)
+
+    # Clear reasoning on user/developer messages (new turn boundary)
+    if role in ("user", "developer", "system") and last_reasoning is not None:
+        last_reasoning[0] = ""
 
 
 def convert_request(
@@ -298,9 +311,9 @@ def convert_request(
             # ── Flush any pending tool_calls as a single assistant message ──
             if pending_tool_calls:
                 reasoning = last_reasoning[0] if last_reasoning and last_reasoning[0] else None
-                if reasoning:
-                    last_reasoning[0] = ""
-                _merge_tool_calls_into_last_assistant(
+                # Do NOT clear last_reasoning — reasoning persists across all
+                # assistant items in the same turn (content message + tool_calls).
+                _add_or_merge_assistant_tool_calls(
                     messages, pending_tool_calls, reasoning_content=reasoning
                 )
                 pending_tool_calls = []
@@ -311,9 +324,7 @@ def convert_request(
         # ── Flush any remaining tool_calls at end of input ──
         if pending_tool_calls:
             reasoning = last_reasoning[0] if last_reasoning and last_reasoning[0] else None
-            if reasoning:
-                last_reasoning[0] = ""
-            _merge_tool_calls_into_last_assistant(
+            _add_or_merge_assistant_tool_calls(
                 messages, pending_tool_calls, reasoning_content=reasoning
             )
 

@@ -132,8 +132,28 @@ class DeepSeekClient:
             stream=True,
         )
 
+        chunk_count = 0
         async for chunk in parse_sse_stream(response):
+            chunk_count += 1
+            if chunk_count == 1:
+                logger.info(
+                    "First stream chunk: choices=%d keys=%s",
+                    len(chunk.get("choices", [])),
+                    list(chunk.keys()),
+                )
+            if chunk_count <= 3:
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    logger.info(
+                        "  choice[%d] delta: content=%s reasoning=%s tool_calls=%s finish=%s",
+                        choice.get("index", 0),
+                        "yes" if delta.get("content") is not None else "no",
+                        "yes(%dc)" % len(delta["reasoning_content"]) if delta.get("reasoning_content") else "no",
+                        "yes(%d)" % len(delta.get("tool_calls", [])) if delta.get("tool_calls") else "no",
+                        choice.get("finish_reason", "no"),
+                    )
             yield chunk
+        logger.info("Stream ended after %d chunks", chunk_count)
 
     async def list_models(self, api_key: str) -> dict[str, Any]:
         """Fetch available models from the DeepSeek API.

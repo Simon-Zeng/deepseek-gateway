@@ -65,11 +65,12 @@ async def responses(
         )
         return error_resp
 
-    # ── Forward reasoning.effort ONLY if target model supports thinking ──
+    # ── Enable thinking mode for REASONER models ──
     # Setting thinking on a non-thinking model (e.g. deepseek-v4-flash) causes
     # DeepSeek API to return 400 Bad Request.
-    if request.reasoning and request.reasoning.effort:
-        if mapper.is_thinking_model(mapping.target_model):
+    if mapper.is_thinking_model(mapping.target_model):
+        if request.reasoning and request.reasoning.effort:
+            # Client explicitly set reasoning effort — use it
             ds_effort = map_reasoning_effort(request.reasoning.effort)
             if ds_effort:
                 deepseek_request.reasoning_effort = ds_effort
@@ -78,7 +79,19 @@ async def responses(
                     "Forwarded reasoning.effort=%s -> %s to %s (thinking model)",
                     request.reasoning.effort, ds_effort, mapping.target_model,
                 )
-        else:
+        elif mapping.model_type == ModelType.REASONER:
+            # REASONER model but client didn't send reasoning.effort —
+            # enable thinking with default "high" effort so DeepSeek returns
+            # reasoning_content. Without this, DeepSeek won't produce reasoning
+            # text even on Pro/R1 models.
+            deepseek_request.reasoning_effort = "high"
+            deepseek_request.thinking = {"type": "enabled"}
+            logger.debug(
+                "Auto-enabled thinking (high) for REASONER model %s (no client effort)",
+                mapping.target_model,
+            )
+    else:
+        if request.reasoning and request.reasoning.effort:
             logger.debug(
                 "Skipping reasoning.effort=%s: model %s does not support thinking",
                 request.reasoning.effort, mapping.target_model,

@@ -80,7 +80,7 @@ def convert_request(
             # preserve the text content instead of discarding it.
             ds_msg = DeepSeekMessage(
                 role=role,
-                content=text_content or "",
+                content=text_content,
                 tool_calls=tool_calls,
             )
             # In thinking mode, DeepSeek requires reasoning_content to be passed
@@ -222,6 +222,8 @@ def convert_response(
                     "input": tc_input,
                 })
 
+    # DeepSeek returned no content — fall back to an empty text block.
+    logger.warning("DeepSeek returned empty response with no content, reasoning, or tool calls")
     # Ensure at least one content block (Anthropic requires non-empty content)
     if not content_blocks:
         content_blocks.append(TextResponseBlock(text=""))

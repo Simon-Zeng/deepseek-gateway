@@ -66,6 +66,20 @@ async def anthropic_messages(
         )
         return error_resp
 
+    # ── Auto-enable thinking for REASONER models if not already set ──
+    # The Anthropic converter only enables thinking when the client sends
+    # a thinking config block. But Claude Code using a REASONER model should
+    # always get reasoning_content back from DeepSeek. Enable it with default
+    # "high" effort if the model is a thinking model and thinking wasn't set.
+    if mapper.is_thinking_model(mapping.target_model) and mapping.model_type == ModelType.REASONER:
+        if not deepseek_request.thinking:
+            deepseek_request.thinking = {"type": "enabled"}
+            deepseek_request.reasoning_effort = "high"
+            logger.debug(
+                "Auto-enabled thinking (high) for Anthropic REASONER model %s (no client thinking config)",
+                mapping.target_model,
+            )
+
     # ── Call DeepSeek ──
     if request.stream:
         return await _handle_streaming(client, deepseek_request, api_key, request.model, mapping)
